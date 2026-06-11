@@ -1,0 +1,23 @@
+nodes:
+  node1:
+    jetson_ip: 172.26.42.167
+    jetson_user: kelrod
+    rosbridge_port: 9090
+    lidar_topic: /livox/lidar
+    foreground_topic: /livox/lidar_foreground
+    bg_model_path: ~/background_statistical.npz
+    bg_sigma: 2.0
+    bg_z_min: -2.8
+    bg_z_max: -0.5
+
+  # node2 — Mid-360S on 192.168.1.144, Jetson at 172.26.165.1 (uncomment when ready)
+  # node2:
+  #   jetson_ip: 172.26.165.1
+  #   jetson_user: kelrod
+  #   rosbridge_port: 9090
+  #   lidar_topic: /livox/lidar
+  #   foreground_topic: /livox/lidar_foreground
+  #   bg_model_path: ~/background_statistical.npz
+  #   bg_sigma: 2.0
+  #   bg_z_min: -2.8
+  #   bg_z_max: -0.5

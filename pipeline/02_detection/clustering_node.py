@@ -522,41 +522,47 @@ def run_test():
 
 # ─── main ─────────────────────────────────────────────────────────────────────
 
+def _load_node_config(config_path: str, node_name: str) -> dict:
+    """Load node settings from nodes_config.yaml."""
+    import yaml
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    nodes = data.get("nodes", {})
+    if node_name not in nodes:
+        raise ValueError(
+            f"Node '{node_name}' not found in {config_path}. "
+            f"Available: {list(nodes.keys())}"
+        )
+    return nodes[node_name]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Euclidean Clustering Node for Person Detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--jetson_ip", type=str,
-                        default="172.26.42.167",
-                        help="Jetson IP address")
-    parser.add_argument("--port", type=int, default=9090,
-                        help="rosbridge websocket port (default 9090)")
-    parser.add_argument("--topic", type=str,
-                        default="/livox/lidar_foreground",
-                        help="Input foreground point cloud topic")
+
+    # Config-file mode (alternative to per-flag connection args)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to nodes_config.yaml (sets connection defaults)")
+    parser.add_argument("--node", type=str, default="node1",
+                        help="Node name in nodes_config.yaml (default: node1)")
+
+    # Connection args — None default so config-file values can fill in
+    parser.add_argument("--jetson_ip", type=str, default=None,
+                        help="Jetson IP address (overrides --config)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="rosbridge websocket port (overrides --config, default 9090)")
+    parser.add_argument("--topic", type=str, default=None,
+                        help="Input foreground point cloud topic (overrides --config)")
 
     parser.add_argument("--cluster_tol", type=float, default=0.4,
-                        help="""
-Euclidean clustering distance tolerance in metres (default 0.4).
-Points within this distance join the same cluster.
-  Too small (<0.25): one person split into multiple clusters
-  Too large (>0.6):  adjacent people merged into one cluster
-Recommended for 3 m ceiling view: 0.35-0.45
-""")
+                        help="Euclidean clustering distance tolerance in metres (default 0.4)")
     parser.add_argument("--min_points", type=int, default=8,
-                        help="""
-Minimum cluster size (default 8). Clusters below this are discarded as noise.
-At 3 m height a person yields ~30-80 points. 8 is conservative.
-Raise to 15-20 if false positives are a problem.
-""")
+                        help="Minimum cluster size; smaller clusters are noise (default 8)")
     parser.add_argument("--max_points", type=int, default=800,
-                        help="""
-Maximum cluster size (default 800). Clusters above this are discarded
-(large objects such as carts or pillars).
-A normal person at 3 m height has <150 points; 800 is permissive.
-""")
+                        help="Maximum cluster size; larger clusters are ignored (default 800)")
     parser.add_argument("--max_persons", type=int, default=20,
                         help="Maximum detections to output (default 20)")
     parser.add_argument("--test", action="store_true",
@@ -566,15 +572,42 @@ A normal person at 3 m height has <150 points; 800 is permissive.
     if args.test:
         run_test()
     else:
+        # Resolve connection parameters: CLI args override config file
+        jetson_ip = args.jetson_ip
+        port      = args.port
+        topic     = args.topic
+
+        if args.config is not None:
+            try:
+                node_cfg = _load_node_config(args.config, args.node)
+            except (FileNotFoundError, ValueError) as e:
+                print(f"Config error: {e}")
+                exit(1)
+            if jetson_ip is None:
+                jetson_ip = node_cfg.get("jetson_ip", "172.26.42.167")
+            if port is None:
+                port = int(node_cfg.get("rosbridge_port", 9090))
+            if topic is None:
+                topic = node_cfg.get("foreground_topic", "/livox/lidar_foreground")
+
+        # Fall back to hard-coded defaults if nothing provided
+        if jetson_ip is None:
+            jetson_ip = "172.26.42.167"
+        if port is None:
+            port = 9090
+        if topic is None:
+            topic = "/livox/lidar_foreground"
+
         if not WEBSOCKET_AVAILABLE:
             print("ERROR: websocket-client not installed.")
             print("Install: pip install websocket-client")
             print("Or run --test to verify the algorithm works.")
             exit(1)
+
         node = ClusteringNode(
-            jetson_ip=args.jetson_ip,
-            port=args.port,
-            input_topic=args.topic,
+            jetson_ip=jetson_ip,
+            port=port,
+            input_topic=topic,
             cluster_tol=args.cluster_tol,
             min_points=args.min_points,
             max_points=args.max_points,
