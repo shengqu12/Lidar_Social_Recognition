@@ -557,14 +557,14 @@ if __name__ == "__main__":
     parser.add_argument("--topic", type=str, default=None,
                         help="Input foreground point cloud topic (overrides --config)")
 
-    parser.add_argument("--cluster_tol", type=float, default=0.4,
-                        help="Euclidean clustering distance tolerance in metres (default 0.4)")
-    parser.add_argument("--min_points", type=int, default=8,
-                        help="Minimum cluster size; smaller clusters are noise (default 8)")
-    parser.add_argument("--max_points", type=int, default=800,
-                        help="Maximum cluster size; larger clusters are ignored (default 800)")
-    parser.add_argument("--max_persons", type=int, default=20,
-                        help="Maximum detections to output (default 20)")
+    parser.add_argument("--cluster_tol", type=float, default=None,
+                        help="Clustering distance tolerance in metres (overrides config; default 0.4)")
+    parser.add_argument("--min_points", type=int, default=None,
+                        help="Minimum cluster size, smaller = noise (overrides config; default 8)")
+    parser.add_argument("--max_points", type=int, default=None,
+                        help="Maximum cluster size, larger = ignored (overrides config; default 800)")
+    parser.add_argument("--max_persons", type=int, default=None,
+                        help="Maximum detections to output (overrides config; default 20)")
     parser.add_argument("--test", action="store_true",
                         help="Run algorithm self-test without ROS/network")
     args = parser.parse_args()
@@ -572,11 +572,12 @@ if __name__ == "__main__":
     if args.test:
         run_test()
     else:
-        # Resolve connection parameters: CLI args override config file
+        # Resolve parameters: CLI arg > config file > hardcoded default
         jetson_ip = args.jetson_ip
         port      = args.port
         topic     = args.topic
 
+        cfg_clustering = {}
         if args.config is not None:
             try:
                 node_cfg = _load_node_config(args.config, args.node)
@@ -589,14 +590,27 @@ if __name__ == "__main__":
                 port = int(node_cfg.get("rosbridge_port", 9090))
             if topic is None:
                 topic = node_cfg.get("foreground_topic", "/livox/lidar_foreground")
+            cfg_clustering = node_cfg.get("clustering", {})
 
-        # Fall back to hard-coded defaults if nothing provided
+        # Fall back to hardcoded defaults if nothing provided
         if jetson_ip is None:
             jetson_ip = "172.26.42.167"
         if port is None:
             port = 9090
         if topic is None:
             topic = "/livox/lidar_foreground"
+
+        cluster_tol = args.cluster_tol if args.cluster_tol is not None \
+            else cfg_clustering.get("cluster_tol", 0.4)
+        min_points  = args.min_points  if args.min_points  is not None \
+            else cfg_clustering.get("min_points", 8)
+        max_points  = args.max_points  if args.max_points  is not None \
+            else cfg_clustering.get("max_points", 800)
+        max_persons = args.max_persons if args.max_persons is not None \
+            else cfg_clustering.get("max_persons", 20)
+
+        print(f"Clustering params: tol={cluster_tol}m  "
+              f"min={min_points}  max={max_points}  max_persons={max_persons}")
 
         if not WEBSOCKET_AVAILABLE:
             print("ERROR: websocket-client not installed.")
@@ -608,9 +622,9 @@ if __name__ == "__main__":
             jetson_ip=jetson_ip,
             port=port,
             input_topic=topic,
-            cluster_tol=args.cluster_tol,
-            min_points=args.min_points,
-            max_points=args.max_points,
-            max_persons=args.max_persons,
+            cluster_tol=cluster_tol,
+            min_points=min_points,
+            max_points=max_points,
+            max_persons=max_persons,
         )
         node.spin()

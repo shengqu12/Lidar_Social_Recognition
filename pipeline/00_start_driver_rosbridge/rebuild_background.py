@@ -132,26 +132,39 @@ def record_empty_scene(ip: str, user: str, topic: str,
         print(f"  Removing old ~/{bag_name}/ ...")
         ssh_run(ip, user, f"rm -rf ~/{bag_name}", check=True)
 
-    # Start recording in background with max-bag-duration to auto-split files
+    # Use 'timeout' to auto-stop recording after duration seconds.
+    # This is reliable: timeout kills the child process directly,
+    # no need to track PID across SSH connections.
     cmd = (
         f"source /opt/ros/humble/setup.bash && "
         f"source ~/ros2_ws/install/setup.bash && "
-        f"nohup ros2 bag record {topic} -o ~/{bag_name} > /tmp/bag_record.log 2>&1 & "
-        f"echo $!"
+        f"nohup timeout {duration} "
+        f"ros2 bag record {topic} -o ~/{bag_name} "
+        f"> /tmp/bag_record.log 2>&1 & echo STARTED"
     )
     result = ssh_run(ip, user, cmd, check=True)
-    record_pid = result.stdout.strip()
-    print(f"  Recording started (PID {record_pid})")
+    if "STARTED" not in result.stdout:
+        print("  ERROR: Failed to start recording.")
+        sys.exit(1)
+    print(f"  Recording started (auto-stops after {duration}s)")
 
-    # Wait with countdown
-    for remaining in range(duration, 0, -10):
-        print(f"  {remaining}s remaining...")
-        time.sleep(min(10, remaining))
+    # Real-time countdown printed to console
+    print(f"  Progress: ", end="", flush=True)
+    for elapsed in range(duration):
+        time.sleep(1)
+        if (elapsed + 1) % 10 == 0:
+            remaining = duration - elapsed - 1
+            print(f"{elapsed+1}s", end="", flush=True)
+            if remaining > 0:
+                print("...", end="", flush=True)
+    print(" done")
 
-    # Stop recording
-    print("  Stopping recording...")
-    ssh_run(ip, user, f"kill {record_pid} 2>/dev/null; pkill -f 'ros2 bag record' 2>/dev/null")
-    time.sleep(3)  # Allow rosbag2 to flush cache
+    # Wait for rosbag2 to flush write cache
+    print("  Flushing rosbag2 cache...")
+    time.sleep(4)
+
+    # Belt-and-suspenders: kill any stray recording process
+    ssh_run(ip, user, "pkill -9 -f 'ros2 bag record' 2>/dev/null; true")
 
     # Check what was recorded
     result = ssh_run(ip, user, f"ls -lh ~/{bag_name}/ 2>/dev/null")
@@ -307,8 +320,8 @@ def main():
     user = node['jetson_user']
     topic = node.get('lidar_topic', '/livox/lidar')
 
-    # Determine output paths
-    remote_model = f"~/background_statistical_{args.node}.npz"
+    # Determine output paths — bg_model_path in config is the remote (Jetson) path
+    remote_model = node.get('bg_model_path', f"~/background_statistical_{args.node}.npz")
     if args.output:
         local_model = args.output
     else:

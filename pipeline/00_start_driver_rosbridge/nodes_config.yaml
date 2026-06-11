@@ -5,10 +5,15 @@ nodes:
     rosbridge_port: 9090
     lidar_topic: /livox/lidar
     foreground_topic: /livox/lidar_foreground
-    bg_model_path: ~/background_statistical.npz
+    bg_model_path: ~/background_statistical_node1.npz
     bg_sigma: 2.0
     bg_z_min: -2.8
     bg_z_max: -0.5
+    clustering:
+      cluster_tol: 0.4
+      min_points: 8
+      max_points: 800
+      max_persons: 20
 
   # node2 — Mid-360S on 192.168.1.144, Jetson at 172.26.165.1 (uncomment when ready)
   # node2:
@@ -21,3 +26,8 @@ nodes:
   #   bg_sigma: 2.0
   #   bg_z_min: -2.8
   #   bg_z_max: -0.5
+  #   clustering:
+  #     cluster_tol: 0.4
+  #     min_points: 8
+  #     max_points: 800
+  #     max_persons: 20
