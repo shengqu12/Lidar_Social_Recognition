@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Data and models (too large for git)
+data/rosbags/
+models/*.npz
+models/*.pth
+models/*.ckpt
+dataset/
+
+# ROS
+*.bag
+log/
+
+# Third-party and unrelated repos (have their own git history)
+third_party/
+card_reader/
+
+# OS
+.DS_Store
