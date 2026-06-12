@@ -25,12 +25,16 @@ Requirements:
 
 What this script does:
     1. Checks Jetson disk space (warns if < 2GB free)
-    2. Records a 60-second empty-scene rosbag on the Jetson
-    3. Builds a statistical background model from the bag (on the Jetson,
-       using ROS2 Humble — avoids the rosbag2_py version mismatch on Legion)
-    4. Downloads the model to local models/ directory
-    5. Deletes the rosbag from the Jetson to free disk space
-    6. Prints the command to update nodes_config.yaml
+    2. Verifies LiDAR is actively publishing (aborts if not, unless --force)
+    3. Records a 60-second empty-scene rosbag on the Jetson
+    4. Validates the bag file is large enough to contain real data (aborts if not)
+    5. Builds a statistical background model to a TEMPORARY file on the Jetson
+       (using ROS2 Humble — avoids the rosbag2_py version mismatch on Legion)
+    6. Validates voxel count >= 100 before overwriting the existing model
+    7. Atomically renames the temporary file over the existing model
+    8. Downloads the model to local models/ directory
+    9. Deletes the rosbag from the Jetson to free disk space
+   10. Prints the command to update nodes_config.yaml
 
 Algorithm reference:
     PALMAR (Ul Alam et al. 2021) - voxelized feature representation
@@ -38,12 +42,20 @@ Algorithm reference:
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import time
 import os
 from pathlib import Path
 import yaml
+
+# Minimum .db3 size (bytes) for a real recording.
+# A 60s LiDAR bag is hundreds of MB; 24KB = empty bag (driver not publishing).
+BAG_MIN_BYTES = 1_000_000  # 1 MB
+
+# Minimum background voxels to consider a build valid.
+VOXEL_MIN_COUNT = 100
 
 
 # ─── Config loader ────────────────────────────────────────────────────────────
@@ -87,11 +99,9 @@ def check_disk_space(ip: str, user: str):
     line = result.stdout.strip()
     print(f"  {line}")
 
-    # Parse available space
     parts = line.split()
     if len(parts) >= 4:
         avail = parts[3]
-        # Rough check: warn if less than 2G
         if avail.endswith('M') or (avail.endswith('G') and float(avail[:-1]) < 2.0):
             print(f"  WARNING: Only {avail} available on Jetson.")
             print("  Consider cleaning up before recording.")
@@ -102,7 +112,16 @@ def check_disk_space(ip: str, user: str):
     print("  Disk space OK.")
 
 
-def check_lidar_publishing(ip: str, user: str, topic: str):
+def _print_lidar_guidance(user: str, ip: str, node_name: str, topic: str):
+    print(f"  Make sure services are running BEFORE rebuilding:")
+    print(f"    python3 pipeline/00_start_driver_rosbridge/launcher.py "
+          f"--start --node {node_name}")
+    print(f"  Then verify the LiDAR is publishing:")
+    print(f"    ssh {user}@{ip} \"ros2 topic hz {topic}\"")
+
+
+def check_lidar_publishing(ip: str, user: str, topic: str,
+                           node_name: str = 'node1', force: bool = False):
     print(f"Checking LiDAR is publishing on {topic}...")
     result = ssh_run(
         ip, user,
@@ -111,14 +130,18 @@ def check_lidar_publishing(ip: str, user: str, topic: str):
         f"timeout 5 ros2 topic hz {topic} --window 5 2>&1 | head -5"
     )
     if "average rate" in result.stdout:
-        print(f"  LiDAR is publishing.")
+        for line in result.stdout.splitlines():
+            if "average rate" in line:
+                print(f"  LiDAR is publishing: {line.strip()}")
+                break
+        return
+
+    print(f"\nERROR: LiDAR does not appear to be publishing on {topic}.")
+    _print_lidar_guidance(user, ip, node_name, topic)
+    if force:
+        print("  --force passed, continuing anyway.")
     else:
-        print(f"  WARNING: LiDAR does not appear to be publishing on {topic}.")
-        print(f"  Make sure the LiDAR driver is running:")
-        print(f"    python3 pipeline/00_start_driver_rosbridge/launcher.py --start")
-        answer = input("  Continue anyway? [y/N] ").strip().lower()
-        if answer != 'y':
-            sys.exit(0)
+        sys.exit(1)
 
 
 def record_empty_scene(ip: str, user: str, topic: str,
@@ -186,11 +209,47 @@ def record_empty_scene(ip: str, user: str, topic: str,
     return first_db3, bag_name
 
 
+def validate_bag_size(ip: str, user: str, db3_path: str,
+                      node_name: str, topic: str):
+    """Abort if the .db3 is too small to contain real LiDAR data."""
+    print("Validating bag file size...")
+    result = ssh_run(ip, user, f"stat -c %s {db3_path}")
+    try:
+        size_bytes = int(result.stdout.strip())
+    except ValueError:
+        print("  WARNING: Could not determine bag size, proceeding.")
+        return
+
+    size_kb = size_bytes / 1024
+    size_mb = size_bytes / (1024 * 1024)
+    if size_bytes < BAG_MIN_BYTES:
+        print(f"\nERROR: Recorded bag is only {size_kb:.0f}KB — "
+              f"the LiDAR driver was likely not publishing.")
+        _print_lidar_guidance(user, ip, node_name, topic)
+        print("Do NOT proceed to build or overwrite the existing model.")
+        sys.exit(1)
+    print(f"  Bag size OK: {size_mb:.1f} MB")
+
+
 def build_model_on_jetson(ip: str, user: str, db3_path: str,
                           output_path: str, voxel_size: float,
-                          max_frames: int):
+                          max_frames: int) -> tuple:
+    """
+    Build the model to a temp file on the Jetson, streaming output live.
+
+    Returns (temp_path, captured_output). The caller must call
+    validate_and_promote_model() to rename temp_path → output_path.
+    """
     print(f"\nBuilding statistical background model on Jetson...")
     print(f"  voxel_size={voxel_size}, max_frames={max_frames}")
+
+    # Build to a temp filename so a crashed/empty build never silently
+    # overwrites a working model.
+    if output_path.endswith('.npz'):
+        temp_path = output_path[:-4] + '_new.npz'
+    else:
+        temp_path = output_path + '_new.npz'
+    print(f"  Building to temp: {temp_path}")
 
     # Check build script exists on Jetson
     if not ssh_ok(ip, user, "test -f ~/statistical_bg_build.py"):
@@ -211,27 +270,91 @@ def build_model_on_jetson(ip: str, user: str, db3_path: str,
         f"source ~/ros2_ws/install/setup.bash && "
         f"python3 ~/statistical_bg_build.py "
         f"--bag {db3_path} "
-        f"--output {output_path} "
+        f"--output {temp_path} "
         f"--voxel_size {voxel_size} "
         f"--max_frames {max_frames}"
     )
+
     print("  Running build (may take 30-60s)...")
-    result = subprocess.run(
+    # Stream output to console while capturing for voxel-count validation.
+    proc = subprocess.Popen(
         ["ssh", f"{user}@{ip}", cmd],
-        capture_output=False,  # Show output in real time
-        text=True
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
-    if result.returncode != 0:
-        print("  ERROR: Model build failed.")
+    captured_lines = []
+    for line in proc.stdout:
+        print(line, end="")
+        sys.stdout.flush()
+        captured_lines.append(line)
+    proc.wait()
+    captured_output = "".join(captured_lines)
+
+    if proc.returncode != 0:
+        print("  ERROR: Model build failed (non-zero exit).")
+        ssh_run(ip, user, f"rm -f {temp_path}")
         sys.exit(1)
 
-    # Verify model was created
-    if not ssh_ok(ip, user, f"test -f {output_path}"):
-        print(f"  ERROR: Output model not found at {output_path}")
+    # Verify temp model was created
+    if not ssh_ok(ip, user, f"test -f {temp_path}"):
+        print(f"  ERROR: Temp model not found at {temp_path}")
         sys.exit(1)
 
-    size_result = ssh_run(ip, user, f"du -sh {output_path}")
-    print(f"  Model built: {size_result.stdout.strip()}")
+    size_result = ssh_run(ip, user, f"du -sh {temp_path}")
+    print(f"  Temp model built: {size_result.stdout.strip()}")
+
+    return temp_path, captured_output
+
+
+def validate_and_promote_model(ip: str, user: str,
+                               temp_path: str, final_path: str,
+                               build_output: str):
+    """
+    Parse build output for frame/voxel counts. If valid, rename
+    temp_path → final_path on the Jetson. On failure, delete temp_path
+    and exit without touching final_path.
+    """
+    print("\nValidating build output...")
+
+    # "Background voxels (>= N points): M" — post-filter count (authoritative)
+    voxel_count = None
+    m = re.search(r'Background voxels[^:]*:\s*(\d+)', build_output)
+    if m:
+        voxel_count = int(m.group(1))
+    else:
+        # Fallback: "Model saved → ... (N background voxels)"
+        m2 = re.search(r'Model saved.*\((\d+) background voxels\)', build_output)
+        if m2:
+            voxel_count = int(m2.group(1))
+
+    # "Build complete: N frames, M voxels occupied"
+    frames_match = re.search(r'Build complete:\s*(\d+)\s+frames', build_output)
+    frame_count = int(frames_match.group(1)) if frames_match else None
+
+    if frame_count is not None and frame_count == 0:
+        print(f"\nERROR: Build produced 0 frames — "
+              f"the bag contained no valid point cloud frames.")
+        print("The existing model was NOT overwritten.")
+        ssh_run(ip, user, f"rm -f {temp_path}")
+        sys.exit(1)
+
+    if voxel_count is not None and voxel_count < VOXEL_MIN_COUNT:
+        print(f"\nERROR: Build produced only {voxel_count} background voxels "
+              f"(minimum required: {VOXEL_MIN_COUNT}).")
+        print("The existing model was NOT overwritten.")
+        ssh_run(ip, user, f"rm -f {temp_path}")
+        sys.exit(1)
+
+    if voxel_count is None:
+        print("  WARNING: Could not parse voxel count from build output.")
+        print("  Proceeding based on non-zero exit code and file existence.")
+    else:
+        print(f"  Voxel count OK: {voxel_count} background voxels")
+
+    # Atomic rename: temp → final. Old model is only replaced here, after
+    # all validation passes.
+    print(f"  Promoting {temp_path} → {final_path}")
+    ssh_run(ip, user, f"mv {temp_path} {final_path}", check=True)
+    return final_path
 
 
 def download_model(ip: str, user: str,
@@ -308,6 +431,10 @@ def main():
     parser.add_argument('--keep_bag', action='store_true',
                         help='Do not delete the rosbag after building '
                              '(warning: uses disk space on Jetson)')
+    parser.add_argument('--force', action='store_true',
+                        help='Skip the pre-recording LiDAR publishing check. '
+                             'Use only for debugging — bag size and voxel '
+                             'count checks still run unconditionally.')
     args = parser.parse_args()
 
     if args.duration < 30:
@@ -336,6 +463,8 @@ def main():
     print(f"  Duration:    {args.duration}s")
     print(f"  Voxel size:  {args.voxel_size}m")
     print(f"  Output:      {local_model}")
+    if args.force:
+        print(f"  --force:     pre-recording LiDAR check will be skipped")
     print()
 
     # Confirm room is empty
@@ -345,17 +474,26 @@ def main():
         print("Please clear the room first, then re-run.")
         sys.exit(0)
 
-    # Run all steps
+    # Step 1: pre-flight checks
     check_disk_space(ip, user)
-    check_lidar_publishing(ip, user, topic)
+    check_lidar_publishing(ip, user, topic, node_name=args.node, force=args.force)
 
+    # Step 2: record
     db3_path, bag_name = record_empty_scene(
         ip, user, topic, args.duration, args.bag_name)
 
-    build_model_on_jetson(
+    # Step 3: validate bag before touching the existing model
+    validate_bag_size(ip, user, db3_path, args.node, topic)
+
+    # Step 4: build to temp file, stream output
+    temp_path, build_output = build_model_on_jetson(
         ip, user, db3_path, remote_model,
         args.voxel_size, args.max_frames)
 
+    # Step 5: validate voxel count, then atomically rename temp → final
+    validate_and_promote_model(ip, user, temp_path, remote_model, build_output)
+
+    # Step 6: download (only reached after successful promotion)
     download_model(ip, user, remote_model, local_model)
 
     if not args.keep_bag:
