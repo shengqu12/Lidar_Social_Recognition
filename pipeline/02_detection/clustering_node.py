@@ -3,9 +3,9 @@
 Euclidean Clustering Node - Person Detection
 =============================================
 Receives foreground point clouds from background removal,
-applies Euclidean clustering to segment individual person blobs,
-and publishes per-person 3D bounding boxes (for Foxglove visualization)
-and centroid positions (for AB3DMOT tracking).
+applies ROI filtering, frame accumulation, Euclidean clustering,
+cluster shape validation, and publishes per-person 3D bounding boxes
+and centroid positions.
 
 Pipeline position:
   /livox/lidar
@@ -15,32 +15,12 @@ Pipeline position:
       -> /detection_boxes   (MarkerArray, Foxglove visualization)
       -> /detection_centers (PointCloud2, tracking input)
 
+Importable interface (used by tracking_node.py):
+  from clustering_node import detect, apply_roi, is_valid_person_cluster
+
 Launch (Legion laptop, connects to Jetson rosbridge via websocket):
   conda activate livox
-  python3 clustering_node.py \\
-      --jetson_ip 172.26.42.167 \\
-      --topic /livox/lidar_foreground \\
-      --cluster_tol 0.4 \\
-      --min_points 8 \\
-      --max_points 800
-
-Algorithm:
-  Euclidean clustering (a.k.a. Euclidean cluster extraction):
-  Groups points whose pairwise distance is <= cluster_tol into the same cluster.
-  Implemented as BFS + KDTree nearest-neighbor search.
-  Well-suited for overhead ceiling-view scenes: a human body seen from above
-  forms an elliptical blob; cluster_tol=0.4 m connects points on the same person
-  while keeping adjacent people (typically >0.5 m apart) in separate clusters.
-
-References:
-  Yamaguchi et al. 2024 - Euclidean clustering for indoor LiDAR tracking
-  Gomez et al. 2023 - Euclidean distance-based segmentation
-  PCL EuclideanClusterExtraction (same algorithm in C++)
-
-Subscription layer: uses websocket-client directly against rosbridge v2
-protocol (ws://jetson:9090) rather than roslibpy, which has a blocking
-run() call and is unreliable with high-frequency binary topics on
-rosbridge 2.0.6 / ROS2 Humble.
+  python3 clustering_node.py --config nodes_config.yaml --node node1
 """
 
 import argparse
@@ -49,13 +29,31 @@ import json
 import struct
 import threading
 import time
-from typing import List, Tuple
+from collections import deque
+from typing import List, Optional
 
 import numpy as np
 from scipy.spatial import KDTree
 
 
-# ─── Core Algorithm (no ROS dependency, independently testable) ──────────────
+# ─── ROI Filter ───────────────────────────────────────────────────────────────
+
+def apply_roi(pts: np.ndarray, roi_cfg: dict) -> np.ndarray:
+    """
+    Crop points to the axis-aligned ROI box defined in roi_cfg.
+    Returns a (M, 3) array; may be empty.
+    """
+    if not roi_cfg.get("enabled", False) or len(pts) == 0:
+        return pts
+    mask = (
+        (pts[:, 0] >= roi_cfg["x_min"]) & (pts[:, 0] <= roi_cfg["x_max"]) &
+        (pts[:, 1] >= roi_cfg["y_min"]) & (pts[:, 1] <= roi_cfg["y_max"]) &
+        (pts[:, 2] >= roi_cfg["z_min"]) & (pts[:, 2] <= roi_cfg["z_max"])
+    )
+    return pts[mask]
+
+
+# ─── Core Clustering Algorithm ────────────────────────────────────────────────
 
 def euclidean_clustering(
     pts: np.ndarray,
@@ -64,18 +62,16 @@ def euclidean_clustering(
     max_points: int = 800,
 ) -> List[np.ndarray]:
     """
-    Euclidean clustering on a foreground point cloud.
+    BFS Euclidean clustering on a foreground point cloud.
 
     Args:
-        pts:          np.ndarray (N, 3), foreground points after BG removal
-        cluster_tol:  Points within this distance (metres) join the same cluster.
-                      Recommended range for 3 m ceiling view: 0.35-0.45 m
-        min_points:   Clusters with fewer points are discarded (noise filter).
-                      At 3 m height a person yields ~30-80 pts; 8 is conservative.
-        max_points:   Clusters with more points are discarded (large objects/carts).
+        pts:          (N, 3) foreground points
+        cluster_tol:  max intra-cluster distance in metres
+        min_points:   discard clusters with fewer points
+        max_points:   discard clusters with more points
 
     Returns:
-        clusters: list of np.ndarray, each shaped (M, 3), sorted large-to-small
+        list of (M, 3) arrays, sorted largest-first
     """
     if len(pts) < min_points:
         return []
@@ -88,7 +84,6 @@ def euclidean_clustering(
         if visited[seed_idx]:
             continue
 
-        # BFS expansion for this cluster
         cluster_indices = []
         queue = [seed_idx]
         visited[seed_idx] = True
@@ -96,9 +91,7 @@ def euclidean_clustering(
         while queue:
             current = queue.pop(0)
             cluster_indices.append(current)
-            neighbors = tree.query_ball_point(
-                pts[current], cluster_tol)
-            for nb in neighbors:
+            for nb in tree.query_ball_point(pts[current], cluster_tol):
                 if not visited[nb]:
                     visited[nb] = True
                     queue.append(nb)
@@ -106,7 +99,6 @@ def euclidean_clustering(
         if min_points <= len(cluster_indices) <= max_points:
             clusters.append(pts[cluster_indices])
 
-    # Sort by point count descending (more points = more likely a real person)
     clusters.sort(key=lambda c: len(c), reverse=True)
     return clusters
 
@@ -115,24 +107,86 @@ def cluster_to_bbox(cluster: np.ndarray) -> dict:
     """
     Compute 3D bounding box and centroid for one cluster.
 
-    Returns dict with:
-        center:   np.ndarray (3,) - centroid xyz
-        size:     np.ndarray (3,) - extent (dx, dy, dz)
-        bbox_min: np.ndarray (3,) - minimum corner
-        bbox_max: np.ndarray (3,) - maximum corner
-        n_points: int             - point count
+    Returns:
+        center, size, bbox_min, bbox_max, n_points
     """
     bbox_min = cluster.min(axis=0)
     bbox_max = cluster.max(axis=0)
     center = (bbox_min + bbox_max) / 2.0
     size = bbox_max - bbox_min
     return {
-        'center':   center,
-        'size':     size,
-        'bbox_min': bbox_min,
-        'bbox_max': bbox_max,
-        'n_points': len(cluster),
+        "center":   center,
+        "size":     size,
+        "bbox_min": bbox_min,
+        "bbox_max": bbox_max,
+        "n_points": len(cluster),
     }
+
+
+# ─── Cluster Shape Validation ─────────────────────────────────────────────────
+
+def is_valid_person_cluster(bbox: dict, filter_cfg: dict) -> bool:
+    """
+    Reject clusters that don't match expected human geometry:
+      - Both XY extents must be within [min_xy_size, max_xy_size]
+      - XY aspect ratio must be <= max_aspect_ratio  (kills wall lines)
+    """
+    sx, sy = float(bbox["size"][0]), float(bbox["size"][1])
+    min_s = float(filter_cfg.get("min_xy_size", 0.15))
+    max_s = float(filter_cfg.get("max_xy_size", 1.2))
+    max_ar = float(filter_cfg.get("max_aspect_ratio", 4.0))
+
+    if sx < min_s or sy < min_s:
+        return False
+    if sx > max_s or sy > max_s:
+        return False
+    aspect = max(sx, sy) / (min(sx, sy) + 1e-6)
+    if aspect > max_ar:
+        return False
+    return True
+
+
+# ─── High-level detect() for use by tracking_node ────────────────────────────
+
+def detect(
+    pts: np.ndarray,
+    cluster_tol: float = 0.4,
+    min_points: int = 8,
+    max_points: int = 800,
+    max_persons: int = 10,
+    roi_cfg: Optional[dict] = None,
+    filter_cfg: Optional[dict] = None,
+) -> List[dict]:
+    """
+    Full detection pipeline on a point array:
+      ROI filter → Euclidean clustering → bbox → shape filter
+
+    Args:
+        pts:          (N, 3) foreground points (may be from multiple frames)
+        roi_cfg:      dict from nodes_config roi section (or None to skip)
+        filter_cfg:   dict from nodes_config cluster_filter section (or None to skip)
+
+    Returns:
+        list of bbox dicts, at most max_persons entries
+    """
+    if roi_cfg:
+        pts = apply_roi(pts, roi_cfg)
+
+    if len(pts) < min_points:
+        return []
+
+    clusters = euclidean_clustering(pts, cluster_tol, min_points, max_points)
+
+    detections = []
+    for c in clusters:
+        bbox = cluster_to_bbox(c)
+        if filter_cfg and not is_valid_person_cluster(bbox, filter_cfg):
+            continue
+        detections.append(bbox)
+        if len(detections) >= max_persons:
+            break
+
+    return detections
 
 
 # ─── RosBridge WebSocket Client ───────────────────────────────────────────────
@@ -142,24 +196,18 @@ try:
     WEBSOCKET_AVAILABLE = True
 except ImportError:
     WEBSOCKET_AVAILABLE = False
-    print("[WARN] websocket-client not installed. "
-          "Run: pip install websocket-client")
+    print("[WARN] websocket-client not installed. Run: pip install websocket-client")
 
 
 class RosBridgeClient:
     """
-    Minimal rosbridge v2 WebSocket client using websocket-client.
-
-    Replaces roslibpy because roslibpy's run() blocks the calling thread
-    and is unreliable with high-frequency binary topics (PointCloud2) on
-    rosbridge 2.0.6 / ROS2 Humble.
-
-    Protocol: https://github.com/RobotWebTools/rosbridge_suite/blob/ros2/ROSBRIDGE_PROTOCOL.md
+    Minimal rosbridge v2 WebSocket client.
+    Uses websocket-client directly to avoid roslibpy blocking issues.
     """
 
     def __init__(self, host: str, port: int):
         self.url = f"ws://{host}:{port}"
-        self._topic_callbacks = {}   # topic -> callback(msg_dict)
+        self._topic_callbacks = {}
         self._ws = None
         self._thread = None
         self._connected_event = threading.Event()
@@ -179,8 +227,7 @@ class RosBridgeClient:
             daemon=True,
         )
         self._thread.start()
-        connected = self._connected_event.wait(timeout=timeout)
-        return connected
+        return self._connected_event.wait(timeout=timeout)
 
     def _on_open(self, ws):
         self.is_connected = True
@@ -219,18 +266,10 @@ class RosBridgeClient:
         })
 
     def advertise(self, topic: str, msg_type: str):
-        self._send({
-            "op": "advertise",
-            "topic": topic,
-            "type": msg_type,
-        })
+        self._send({"op": "advertise", "topic": topic, "type": msg_type})
 
     def publish(self, topic: str, msg: dict):
-        self._send({
-            "op": "publish",
-            "topic": topic,
-            "msg": msg,
-        })
+        self._send({"op": "publish", "topic": topic, "msg": msg})
 
     def _send(self, obj: dict):
         if self._ws and self.is_connected:
@@ -248,9 +287,9 @@ class RosBridgeClient:
 
 class ClusteringNode:
     """
-    Connects to Jetson rosbridge via WebSocket, subscribes to the foreground
-    point cloud, runs Euclidean clustering, and publishes detection results.
-    Runs entirely on the Legion laptop without requiring a local ROS2 install.
+    Connects to Jetson rosbridge, subscribes to the foreground point cloud,
+    runs detection (ROI → accumulation → clustering → shape filter),
+    and publishes /detection_boxes and /detection_centers.
     """
 
     def __init__(self,
@@ -260,69 +299,95 @@ class ClusteringNode:
                  cluster_tol: float,
                  min_points: int,
                  max_points: int,
-                 max_persons: int):
+                 max_persons: int,
+                 accum_frames: int = 1,
+                 bbox_alpha: float = 0.4,
+                 bbox_color: List[float] = None,
+                 roi_cfg: Optional[dict] = None,
+                 filter_cfg: Optional[dict] = None):
 
         self.cluster_tol = cluster_tol
         self.min_points = min_points
         self.max_points = max_points
         self.max_persons = max_persons
+        self.accum_frames = max(1, accum_frames)
+        self.bbox_alpha = bbox_alpha
+        self.bbox_color = bbox_color if bbox_color is not None else [1.0, 0.5, 0.0]
+        self.roi_cfg = roi_cfg or {}
+        self.filter_cfg = filter_cfg or {}
 
         self.frame_count = 0
-        self.last_detections = []
+        self._rejected_count = 0
+        self._frame_buf: deque = deque(maxlen=self.accum_frames)
 
         print(f"Connecting to rosbridge at {jetson_ip}:{port} ...")
         self.client = RosBridgeClient(host=jetson_ip, port=port)
         if not self.client.connect(timeout=10.0):
             raise RuntimeError(
-                f"Failed to connect to rosbridge at {jetson_ip}:{port}. "
-                "Is rosbridge running? Check: "
-                "ros2 launch rosbridge_server rosbridge_websocket_launch.xml")
+                f"Failed to connect to rosbridge at {jetson_ip}:{port}.")
         print(f"Connected: {self.client.is_connected}")
 
-        # Subscribe to foreground point cloud
-        # Use ROS2 fully-qualified type name (sensor_msgs/msg/PointCloud2)
-        # to avoid type-inference errors on rosbridge 2.0.6.
         self.client.subscribe(
             topic=input_topic,
             msg_type="sensor_msgs/msg/PointCloud2",
             callback=self._callback,
             throttle_rate=0,
         )
-
-        # Advertise output topics
-        self.client.advertise(
-            "/detection_boxes",
-            "visualization_msgs/msg/MarkerArray",
-        )
-        self.client.advertise(
-            "/detection_centers",
-            "sensor_msgs/msg/PointCloud2",
-        )
+        self.client.advertise("/detection_boxes",
+                              "visualization_msgs/msg/MarkerArray")
+        self.client.advertise("/detection_centers",
+                              "sensor_msgs/msg/PointCloud2")
 
         self._input_topic = input_topic
         print("Clustering node ready")
         print(f"  Input:  {input_topic}")
         print(f"  Output: /detection_boxes, /detection_centers")
-        print(f"  Params: tol={cluster_tol}m, "
-              f"min={min_points}pts, max={max_points}pts")
+        print(f"  Params: tol={cluster_tol}m  min={min_points}  "
+              f"max={max_points}  accum={accum_frames}frames")
+        if roi_cfg and roi_cfg.get("enabled"):
+            print(f"  ROI:    x[{roi_cfg['x_min']},{roi_cfg['x_max']}]  "
+                  f"y[{roi_cfg['y_min']},{roi_cfg['y_max']}]")
+
+    # ── callback ──────────────────────────────────────────────────────────────
 
     def _callback(self, msg: dict):
         t0 = time.time()
 
         pts = self._decode_pointcloud2(msg)
-        if pts is None or len(pts) < self.min_points:
+        if pts is None or len(pts) == 0:
             return
 
+        # ROI first (on raw frame, before accumulation — cheaper than filtering merged cloud)
+        if self.roi_cfg.get("enabled"):
+            pts = apply_roi(pts, self.roi_cfg)
+
+        self._frame_buf.append(pts)
+
+        # Skip early frames until buffer reaches accum_frames
+        if len(self._frame_buf) < self.accum_frames:
+            return
+
+        merged = np.vstack(list(self._frame_buf))
+
         clusters = euclidean_clustering(
-            pts,
+            merged,
             cluster_tol=self.cluster_tol,
             min_points=self.min_points,
             max_points=self.max_points,
         )
-        clusters = clusters[:self.max_persons]
 
-        detections = [cluster_to_bbox(c) for c in clusters]
-        self.last_detections = detections
+        detections = []
+        rejected = 0
+        for c in clusters:
+            bbox = cluster_to_bbox(c)
+            if self.filter_cfg and not is_valid_person_cluster(bbox, self.filter_cfg):
+                rejected += 1
+                continue
+            detections.append(bbox)
+            if len(detections) >= self.max_persons:
+                break
+
+        self._rejected_count += rejected
 
         header = msg.get("header", {})
         self._publish_markers(detections, header)
@@ -332,11 +397,14 @@ class ClusteringNode:
         self.frame_count += 1
         if self.frame_count % 20 == 0:
             print(f"[frame {self.frame_count:>4}]  "
-                  f"in={len(pts):>4} -> {len(detections):>2} persons | "
-                  f"{dt*1000:.0f}ms")
+                  f"raw={len(pts):>4} merged={len(merged):>5} -> "
+                  f"{len(detections):>2} persons "
+                  f"(rejected {self._rejected_count} total) | {dt*1000:.0f}ms")
+            self._rejected_count = 0
 
-    def _decode_pointcloud2(self, msg: dict) -> np.ndarray:
-        """Extract xyz from a rosbridge-serialized PointCloud2 message."""
+    # ── decode ────────────────────────────────────────────────────────────────
+
+    def _decode_pointcloud2(self, msg: dict) -> Optional[np.ndarray]:
         try:
             data_b64 = msg.get("data", "")
             if not data_b64:
@@ -357,10 +425,10 @@ class ClusteringNode:
 
             pts = []
             for i in range(width):
-                base = i * point_step
-                x = struct.unpack_from("<f", raw, base + x_off)[0]
-                y = struct.unpack_from("<f", raw, base + y_off)[0]
-                z = struct.unpack_from("<f", raw, base + z_off)[0]
+                base_i = i * point_step
+                x = struct.unpack_from("<f", raw, base_i + x_off)[0]
+                y = struct.unpack_from("<f", raw, base_i + y_off)[0]
+                z = struct.unpack_from("<f", raw, base_i + z_off)[0]
                 if np.isfinite(x) and np.isfinite(y) and np.isfinite(z):
                     pts.append((x, y, z))
 
@@ -370,8 +438,9 @@ class ClusteringNode:
             print(f"[WARN] decode error: {e}")
             return None
 
+    # ── publish ───────────────────────────────────────────────────────────────
+
     def _publish_markers(self, detections: List[dict], header: dict):
-        """Publish bounding box markers (displayed as wireframe cubes in Foxglove)."""
         markers = []
         stamp = header.get("stamp", {"sec": 0, "nanosec": 0})
         frame_id = header.get("frame_id", "livox_frame")
@@ -386,31 +455,28 @@ class ClusteringNode:
                 "type": 1,    # CUBE
                 "action": 0,  # ADD
                 "pose": {
-                    "position": {"x": float(c[0]),
-                                 "y": float(c[1]),
+                    "position": {"x": float(c[0]), "y": float(c[1]),
                                  "z": float(c[2])},
-                    "orientation": {"x": 0.0, "y": 0.0,
-                                    "z": 0.0, "w": 1.0},
+                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 },
                 "scale": {"x": max(float(s[0]), 0.3),
                           "y": max(float(s[1]), 0.3),
                           "z": max(float(s[2]), 0.1)},
-                "color": {"r": 1.0, "g": 0.5, "b": 0.0, "a": 0.4},
+                "color": {"r": float(self.bbox_color[0]),
+                          "g": float(self.bbox_color[1]),
+                          "b": float(self.bbox_color[2]),
+                          "a": float(self.bbox_alpha)},
                 "lifetime": {"sec": 0, "nanosec": 300000000},
             })
 
-        # Delete markers from previous frame that are no longer needed
+        # Delete stale markers from previous frames
         for i in range(len(detections), len(detections) + 5):
             markers.append({
                 "header": {"stamp": stamp, "frame_id": frame_id},
-                "ns": "persons",
-                "id": i,
-                "type": 1,
-                "action": 2,  # DELETE
-                "pose": {
-                    "position": {"x": 0.0, "y": 0.0, "z": 0.0},
-                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                },
+                "ns": "persons", "id": i,
+                "type": 1, "action": 2,  # DELETE
+                "pose": {"position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                         "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
                 "scale": {"x": 0.1, "y": 0.1, "z": 0.1},
                 "color": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 0.0},
                 "lifetime": {"sec": 0, "nanosec": 0},
@@ -419,18 +485,15 @@ class ClusteringNode:
         self.client.publish("/detection_boxes", {"markers": markers})
 
     def _publish_centers(self, detections: List[dict], header: dict):
-        """Publish centroid point cloud for AB3DMOT tracking input."""
         if not detections:
             return
-
         stamp = header.get("stamp", {"sec": 0, "nanosec": 0})
         frame_id = header.get("frame_id", "livox_frame")
 
         raw = b""
         for det in detections:
             c = det["center"]
-            raw += struct.pack("<fff",
-                               float(c[0]), float(c[1]), float(c[2]))
+            raw += struct.pack("<fff", float(c[0]), float(c[1]), float(c[2]))
 
         msg = {
             "header": {"stamp": stamp, "frame_id": frame_id},
@@ -450,7 +513,6 @@ class ClusteringNode:
         self.client.publish("/detection_centers", msg)
 
     def spin(self):
-        """Block until Ctrl+C."""
         print("\nRunning... Press Ctrl+C to stop\n")
         try:
             while self.client.is_connected:
@@ -462,12 +524,11 @@ class ClusteringNode:
             print(f"\nStopped after {self.frame_count} frames")
 
 
-# ─── Standalone Algorithm Test (no ROS required) ─────────────────────────────
+# ─── Standalone Algorithm Test ────────────────────────────────────────────────
 
 def run_test():
-    """Validate the clustering algorithm without ROS or network connectivity."""
     print("=" * 55)
-    print("TEST: Euclidean Clustering Algorithm")
+    print("TEST: Detection pipeline (ROI + clustering + shape filter)")
     print("=" * 55)
     rng = np.random.default_rng(0)
 
@@ -478,52 +539,41 @@ def run_test():
             rng.uniform(cz - 0.3, cz, n),
         ]).astype(np.float32)
 
-    persons = [
-        make_person(0.0, 0.0),    # person 1: origin
-        make_person(1.5, 0.5),    # person 2: 1.5 m away
-        make_person(-1.0, 1.2),   # person 3: diagonal
-    ]
+    def make_wall(x_range, y_range, n=100):
+        return np.column_stack([
+            rng.uniform(*x_range, n),
+            rng.uniform(*y_range, n),
+            rng.uniform(-2.0, -1.8, n),
+        ]).astype(np.float32)
 
-    # Residual background noise that BG removal didn't fully eliminate
-    noise = np.column_stack([
-        rng.uniform(-3, 3, 20),
-        rng.uniform(-3, 3, 20),
-        rng.uniform(-2.8, -2.5, 20),
-    ]).astype(np.float32)
+    persons = [make_person(1.5, -1.5), make_person(3.0, -2.5), make_person(-1.0, 1.2)]
+    wall1 = make_wall((-1.5, -0.5), (-5.0, 1.0))   # thin wall strip: excluded by ROI
+    wall2 = make_wall((0.5, 6.0), (-0.5, 0.5))      # elongated: excluded by aspect_ratio
+    pts = np.vstack(persons + [wall1, wall2])
 
-    pts = np.vstack(persons + [noise])
-    print(f"Input: {len(pts)} points "
-          f"(3 persons x 50pts + 20 noise)")
+    roi_cfg = {"enabled": True, "x_min": 0.3, "x_max": 8.0,
+               "y_min": -5.0, "y_max": -0.7, "z_min": -2.5, "z_max": -0.5}
+    filter_cfg = {"min_xy_size": 0.15, "max_xy_size": 1.2, "max_aspect_ratio": 4.0}
 
-    clusters = euclidean_clustering(
-        pts,
-        cluster_tol=0.4,
-        min_points=8,
-        max_points=800,
-    )
+    detections = detect(pts, cluster_tol=0.4, min_points=8,
+                        roi_cfg=roi_cfg, filter_cfg=filter_cfg)
 
-    print(f"Detected: {len(clusters)} clusters")
-    for i, c in enumerate(clusters):
-        bbox = cluster_to_bbox(c)
-        print(f"  Cluster {i+1}: {len(c):>3} pts | "
-              f"center=({bbox['center'][0]:.2f}, "
-              f"{bbox['center'][1]:.2f}, "
-              f"{bbox['center'][2]:.2f}) | "
-              f"size=({bbox['size'][0]:.2f}, "
-              f"{bbox['size'][1]:.2f})")
+    print(f"Input: {len(pts)} pts  |  Detected: {len(detections)} persons")
+    for i, d in enumerate(detections):
+        c = d["center"]
+        s = d["size"]
+        print(f"  #{i+1}: center=({c[0]:.2f},{c[1]:.2f}) "
+              f"size=({s[0]:.2f}x{s[1]:.2f})")
 
-    if len(clusters) == 3:
-        print("\n✓ TEST PASSED: 3 persons correctly detected")
-    else:
-        print(f"\n✗ TEST FAILED: expected 3, got {len(clusters)}")
-
-    return len(clusters) == 3
+    passed = len(detections) == 2  # person at (-1.0,1.2) excluded by ROI; wall2 by aspect
+    print(f"\n{'✓ TEST PASSED' if passed else '✗ TEST FAILED'}: "
+          f"expected 2 persons within ROI, got {len(detections)}")
+    return passed
 
 
-# ─── main ─────────────────────────────────────────────────────────────────────
+# ─── Config loader ────────────────────────────────────────────────────────────
 
 def _load_node_config(config_path: str, node_name: str) -> dict:
-    """Load node settings from nodes_config.yaml."""
     import yaml
     with open(config_path) as f:
         data = yaml.safe_load(f)
@@ -531,10 +581,11 @@ def _load_node_config(config_path: str, node_name: str) -> dict:
     if node_name not in nodes:
         raise ValueError(
             f"Node '{node_name}' not found in {config_path}. "
-            f"Available: {list(nodes.keys())}"
-        )
+            f"Available: {list(nodes.keys())}")
     return nodes[node_name]
 
+
+# ─── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -542,29 +593,19 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-
-    # Config-file mode (alternative to per-flag connection args)
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to nodes_config.yaml (sets connection defaults)")
-    parser.add_argument("--node", type=str, default="node1",
-                        help="Node name in nodes_config.yaml (default: node1)")
-
-    # Connection args — None default so config-file values can fill in
-    parser.add_argument("--jetson_ip", type=str, default=None,
-                        help="Jetson IP address (overrides --config)")
-    parser.add_argument("--port", type=int, default=None,
-                        help="rosbridge websocket port (overrides --config, default 9090)")
-    parser.add_argument("--topic", type=str, default=None,
-                        help="Input foreground point cloud topic (overrides --config)")
-
-    parser.add_argument("--cluster_tol", type=float, default=None,
-                        help="Clustering distance tolerance in metres (overrides config; default 0.4)")
-    parser.add_argument("--min_points", type=int, default=None,
-                        help="Minimum cluster size, smaller = noise (overrides config; default 8)")
-    parser.add_argument("--max_points", type=int, default=None,
-                        help="Maximum cluster size, larger = ignored (overrides config; default 800)")
-    parser.add_argument("--max_persons", type=int, default=None,
-                        help="Maximum detections to output (overrides config; default 20)")
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--node",   type=str, default="node1")
+    parser.add_argument("--jetson_ip",   type=str,   default=None)
+    parser.add_argument("--port",        type=int,   default=None)
+    parser.add_argument("--topic",       type=str,   default=None)
+    parser.add_argument("--cluster_tol", type=float, default=None)
+    parser.add_argument("--min_points",  type=int,   default=None)
+    parser.add_argument("--max_points",  type=int,   default=None)
+    parser.add_argument("--max_persons", type=int,   default=None)
+    parser.add_argument("--accum_frames",type=int,   default=None)
+    parser.add_argument("--bbox_alpha",  type=float, default=None)
+    parser.add_argument("--bbox_color",  type=float, nargs=3, default=None,
+                        metavar=("R", "G", "B"))
     parser.add_argument("--test", action="store_true",
                         help="Run algorithm self-test without ROS/network")
     args = parser.parse_args()
@@ -572,12 +613,14 @@ if __name__ == "__main__":
     if args.test:
         run_test()
     else:
-        # Resolve parameters: CLI arg > config file > hardcoded default
         jetson_ip = args.jetson_ip
         port      = args.port
         topic     = args.topic
 
         cfg_clustering = {}
+        roi_cfg    = {}
+        filter_cfg = {}
+
         if args.config is not None:
             try:
                 node_cfg = _load_node_config(args.config, args.node)
@@ -591,8 +634,9 @@ if __name__ == "__main__":
             if topic is None:
                 topic = node_cfg.get("foreground_topic", "/livox/lidar_foreground")
             cfg_clustering = node_cfg.get("clustering", {})
+            roi_cfg    = node_cfg.get("roi", {})
+            filter_cfg = node_cfg.get("cluster_filter", {})
 
-        # Fall back to hardcoded defaults if nothing provided
         if jetson_ip is None:
             jetson_ip = "172.26.42.167"
         if port is None:
@@ -600,22 +644,19 @@ if __name__ == "__main__":
         if topic is None:
             topic = "/livox/lidar_foreground"
 
-        cluster_tol = args.cluster_tol if args.cluster_tol is not None \
-            else cfg_clustering.get("cluster_tol", 0.4)
-        min_points  = args.min_points  if args.min_points  is not None \
-            else cfg_clustering.get("min_points", 8)
-        max_points  = args.max_points  if args.max_points  is not None \
-            else cfg_clustering.get("max_points", 800)
-        max_persons = args.max_persons if args.max_persons is not None \
-            else cfg_clustering.get("max_persons", 20)
+        cluster_tol  = args.cluster_tol   if args.cluster_tol   is not None else cfg_clustering.get("cluster_tol",   0.4)
+        min_points   = args.min_points    if args.min_points    is not None else cfg_clustering.get("min_points",    8)
+        max_points   = args.max_points    if args.max_points    is not None else cfg_clustering.get("max_points",    800)
+        max_persons  = args.max_persons   if args.max_persons   is not None else cfg_clustering.get("max_persons",   10)
+        accum_frames = args.accum_frames  if args.accum_frames  is not None else cfg_clustering.get("accum_frames",  1)
+        bbox_alpha   = args.bbox_alpha    if args.bbox_alpha    is not None else cfg_clustering.get("bbox_alpha",    0.4)
+        bbox_color   = args.bbox_color    if args.bbox_color    is not None else cfg_clustering.get("bbox_color",    [1.0, 0.5, 0.0])
 
-        print(f"Clustering params: tol={cluster_tol}m  "
-              f"min={min_points}  max={max_points}  max_persons={max_persons}")
+        print(f"Params: tol={cluster_tol}m  min={min_points}  "
+              f"max={max_points}  max_persons={max_persons}  accum={accum_frames}")
 
         if not WEBSOCKET_AVAILABLE:
-            print("ERROR: websocket-client not installed.")
-            print("Install: pip install websocket-client")
-            print("Or run --test to verify the algorithm works.")
+            print("ERROR: pip install websocket-client")
             exit(1)
 
         node = ClusteringNode(
@@ -626,5 +667,10 @@ if __name__ == "__main__":
             min_points=min_points,
             max_points=max_points,
             max_persons=max_persons,
+            accum_frames=accum_frames,
+            bbox_alpha=bbox_alpha,
+            bbox_color=bbox_color,
+            roi_cfg=roi_cfg,
+            filter_cfg=filter_cfg,
         )
         node.spin()

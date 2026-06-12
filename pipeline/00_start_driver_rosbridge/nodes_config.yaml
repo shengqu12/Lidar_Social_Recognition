@@ -10,10 +10,30 @@ nodes:
     bg_z_min: -2.8
     bg_z_max: -0.5
     clustering:
-      cluster_tol: 0.4
+      cluster_tol: 0.2
       min_points: 8
       max_points: 800
-      max_persons: 20
+      max_persons: 10
+      bbox_alpha: 0.4        # 0.0 = fully transparent, 1.0 = fully opaque
+      bbox_color: [1.0, 0.5, 0.0]  # RGB: orange
+      accum_frames: 3        # buffer last N frames before clustering (1 = off)
+    roi:
+      enabled: true
+      x_min:  0.3
+      x_max:  8.0
+      y_min: -5.0
+      y_max: -0.7
+      z_min: -2.5
+      z_max: -0.5
+    cluster_filter:
+      min_xy_size: 0.15      # reject thin wall-line clusters
+      max_xy_size: 1.2       # reject furniture / large-object clusters
+      max_aspect_ratio: 4.0  # reject elongated clusters (walls are long+thin)
+    tracking:
+      max_age: 5             # frames before a coasting track is deleted
+      min_hits: 3            # frames before a new track is confirmed/output
+      max_association_dist: 1.0   # metres; detection→track gate
+      csv_logging: true
 
   # node2 — Mid-360S on 192.168.1.144, Jetson at 172.26.165.1 (uncomment when ready)
   # node2:
@@ -27,7 +47,9 @@ nodes:
   #   bg_z_min: -2.8
   #   bg_z_max: -0.5
   #   clustering:
-  #     cluster_tol: 0.4
+  #     cluster_tol: 0.8
   #     min_points: 8
   #     max_points: 800
   #     max_persons: 20
+  #     bbox_alpha: 0.06
+  #     bbox_color: [1.0, 0.5, 0.0]

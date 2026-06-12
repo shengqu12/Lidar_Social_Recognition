@@ -12,6 +12,7 @@ Usage:
     python3 launcher.py --restart [--node node1]
     python3 launcher.py --status  [--node node1]
     python3 launcher.py --start --with-clustering
+    python3 launcher.py --start --with-tracking
 
     # Node 2 (once configured in nodes_config.yaml):
     python3 launcher.py --restart --node node2
@@ -263,7 +264,7 @@ def check_status(cfg: dict) -> None:
     print(f"    /detection_boxes{'':<26} person bounding boxes")
 
 
-# ─── Local clustering ─────────────────────────────────────────────────────────
+# ─── Local node launchers ─────────────────────────────────────────────────────
 
 def launch_clustering_local(cfg: dict, config_path: str, node_name: str) -> None:
     script = Path(__file__).parent.parent / "02_detection" / "clustering_node.py"
@@ -277,6 +278,25 @@ def launch_clustering_local(cfg: dict, config_path: str, node_name: str) -> None
         "--node",   node_name,
     ]
     print(f"  Running: {' '.join(cmd[1:])}")
+    print("  Press Ctrl+C to stop\n")
+    os.execv(sys.executable, cmd)
+
+
+def launch_tracking_local(cfg: dict, config_path: str, node_name: str) -> None:
+    """Launch tracking node (includes detection; replaces clustering-only node)."""
+    script = Path(__file__).parent.parent / "03_tracking" / "tracking_node.py"
+    if not script.exists():
+        print(f"  ERROR: {script} not found")
+        return
+
+    cmd = [
+        sys.executable, str(script),
+        "--config", config_path,
+        "--node",   node_name,
+    ]
+    print(f"  Running: {' '.join(cmd[1:])}")
+    print("  Publishes: /tracked_boxes  /tracked_centers")
+    print("  Logs CSV:  data/tracklets/session_<time>.csv")
     print("  Press Ctrl+C to stop\n")
     os.execv(sys.executable, cmd)
 
@@ -301,6 +321,8 @@ def main() -> None:
                         help="Check status of all services")
     parser.add_argument("--with-clustering", action="store_true",
                         help="After --start/--restart, also launch clustering node locally")
+    parser.add_argument("--with-tracking", action="store_true",
+                        help="After --start/--restart, launch tracking node (detection + tracking + CSV)")
     parser.add_argument("--node",   default="node1",
                         help="Node name in nodes_config.yaml (default: node1)")
     parser.add_argument("--config", default=default_config,
@@ -357,9 +379,13 @@ def main() -> None:
     print()
     print(f"  Open Foxglove → ws://{cfg['jetson_ip']}:{cfg['rosbridge_port']}")
     print(f"  Run clustering:  python3 launcher.py --with-clustering --node {args.node}")
+    print(f"  Run tracking:    python3 launcher.py --with-tracking  --node {args.node}")
     print("=" * 58)
 
-    if args.with_clustering:
+    if args.with_tracking:
+        time.sleep(2)
+        launch_tracking_local(cfg, args.config, args.node)
+    elif args.with_clustering:
         time.sleep(2)
         launch_clustering_local(cfg, args.config, args.node)
 
