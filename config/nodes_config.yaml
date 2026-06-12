@@ -6,17 +6,17 @@ nodes:
     lidar_topic: /livox/lidar
     foreground_topic: /livox/lidar_foreground
     bg_model_path: ~/background_statistical_node1.npz
-    bg_sigma: 2.0
+    bg_sigma: 2.5
     bg_z_min: -2.8
     bg_z_max: -0.5
     clustering:
       cluster_tol: 0.6
-      min_points: 4
+      min_points: 10
       max_points: 5000
       max_persons: 10
       bbox_alpha: 0.4
       bbox_color: [1.0, 0.5, 0.0]
-      accum_frames: 2
+      accum_frames: 4
       exclusion_zones:
         - cx: 1.56
           cy: -1.67
@@ -37,8 +37,8 @@ nodes:
       z_min: -2.5
       z_max: -0.5
     tracking:
-      max_age: 8
-      min_hits: 2
+      max_age: 15
+      min_hits: 3
       max_association_dist: 1.0
       csv_logging: true
       static_suppress_frames: 20
