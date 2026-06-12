@@ -39,7 +39,7 @@ nodes:
     tracking:
       max_age: 15
       min_hits: 3
-      max_association_dist: 1.0
+      max_association_dist: 0.8
       csv_logging: true
       static_suppress_frames: 20
       static_suppress_dist: 0.30
@@ -47,3 +47,14 @@ nodes:
       static_zone_radius: 0.5
       static_zone_density: 0.75
       static_zone_min_history: 15
+      direction_weight: 0.5
+      direction_min_speed: 0.3
+    behavior:
+      enabled: true
+      window_frames: 30
+      min_window_frames: 15
+      walk_speed_threshold: 0.5
+      standing_height_threshold: 1.2
+      talk_distance_threshold: 1.5
+      talk_duration_sec: 30.0
+      behavior_hold_frames: 5

@@ -26,6 +26,7 @@ import base64
 import colorsys
 import csv
 import json
+import math
 import os
 import struct
 import sys
@@ -34,7 +35,7 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -133,17 +134,79 @@ def track_color(track_id: int):
     return r, g, b
 
 
+# ─── Direction-aware tracker ──────────────────────────────────────────────────
+
+class DirectionAwareTracker(MultiObjectTracker3D):
+    """
+    Extends MultiObjectTracker3D with a motion-direction consistency penalty.
+
+    When a track is moving faster than `direction_min_speed`, matches where
+    the implied motion direction (track → detection) disagrees with the
+    track's Kalman velocity are penalized.  This helps disambiguate two
+    people crossing paths who are close in position but moving oppositely.
+
+    Added cost term: direction_weight * (1 - cos_similarity(v_kalman, v_implied))
+    The term is in [0, 2*direction_weight] — 0 for same direction, max for opposite.
+    """
+
+    def __init__(self,
+                 direction_weight: float = 0.5,
+                 direction_min_speed: float = 0.3,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self._dir_weight   = float(direction_weight)
+        self._dir_min_spd  = float(direction_min_speed)
+
+    def _build_cost(self, det_boxes, det_scores):
+        cost = super()._build_cost(det_boxes, det_scores)
+
+        if self._dir_weight == 0.0:
+            return cost
+
+        T = len(self.tracks)
+        D = len(det_boxes)
+        if T == 0 or D == 0:
+            return cost
+
+        for ti, trk in enumerate(self.tracks):
+            vx    = float(trk.kf.x[3, 0])
+            vy    = float(trk.kf.x[4, 0])
+            speed = math.sqrt(vx * vx + vy * vy)
+            if speed < self._dir_min_spd:
+                continue  # no reliable direction for near-stationary tracks
+
+            trk_x = float(trk.kf.x[0, 0])
+            trk_y = float(trk.kf.x[1, 0])
+
+            for dj in range(D):
+                if cost[ti, dj] >= 1e5:
+                    continue  # already gated out by Mahalanobis
+
+                dx = float(det_boxes[dj][0]) - trk_x
+                dy = float(det_boxes[dj][1]) - trk_y
+                impl_norm = math.sqrt(dx * dx + dy * dy)
+                if impl_norm < 1e-6:
+                    continue
+
+                cos_sim = (vx * dx + vy * dy) / (speed * impl_norm)
+                # (1 - cos_sim) in [0, 2]: 0 = same direction, 2 = opposite
+                cost[ti, dj] += self._dir_weight * (1.0 - float(cos_sim))
+
+        return cost
+
+
 # ─── Tracker wrapper ──────────────────────────────────────────────────────────
 
 class LiveTracker:
     """
-    Wraps MultiObjectTracker3D with parameters tuned for overhead ceiling LiDAR:
+    Wraps DirectionAwareTracker with parameters tuned for overhead ceiling LiDAR:
     - Measurement variance set to reflect ~0.3 m bbox-center noise
     - Association gate corresponding to max_association_dist metres
     - IoU disabled (unreliable for sparse overhead blobs)
     - min_hits / max_age lifecycle from config
     - Static suppression: tracks that don't displace >= static_suppress_dist metres
       over static_suppress_frames frames are classified as furniture and removed
+    - Direction-aware association: penalises cross-path mismatches
     """
 
     def __init__(self,
@@ -152,7 +215,9 @@ class LiveTracker:
                  max_association_dist: float = 1.0,
                  fps: float = 10.0,
                  static_suppress_frames: int = 20,
-                 static_suppress_dist: float = 0.30):
+                 static_suppress_dist: float = 0.30,
+                 direction_weight: float = 0.5,
+                 direction_min_speed: float = 0.3):
         # Kalman dt from observed frame rate
         dt = 1.0 / max(1.0, fps)
 
@@ -169,7 +234,9 @@ class LiveTracker:
         # position history per track: track_id -> deque of (x, y) arrays
         self._pos_history: dict = {}
 
-        self._tracker = MultiObjectTracker3D(
+        self._tracker = DirectionAwareTracker(
+            direction_weight=direction_weight,
+            direction_min_speed=direction_min_speed,
             dt=dt,
             max_age=max_age,
             min_hits=min_hits,
@@ -292,12 +359,17 @@ class ATCLogger:
     Appends trajectory rows to a session CSV in ATC format compatible with
     pipeline/04_encounter_detection/collision_detection.py:
 
-    Columns: timestamp, person_id, x, y, z, velocity, angle1, angle2
+    Columns 1-8 (ATC-compatible, read positionally by existing tools):
+      timestamp, person_id, x, y, z, velocity, angle1, angle2
+    Column 9 (new, ignored by legacy readers):
+      behavior
+
       - timestamp : Unix milliseconds
       - x, y, z  : position in millimetres
       - velocity  : speed in mm/s
       - angle1    : movement direction in radians (atan2(vy, vx))
       - angle2    : same as angle1 (body facing unknown from overhead)
+      - behavior  : one of walking/standing/sitting/talking/unknown
     """
 
     def __init__(self, output_dir: Path):
@@ -308,27 +380,227 @@ class ATCLogger:
         self._w = csv.writer(self._f)
         print(f"[CSV] logging to {self.path}")
 
-    def write(self, tracks: List[dict], wall_time: float):
+    def write(self, tracks: List[dict], wall_time: float,
+              behaviors: Optional[Dict[int, str]] = None):
         ts_ms = int(wall_time * 1000)
         for t in tracks:
             vx, vy = t["vx"], t["vy"]
             speed  = float(np.hypot(vx, vy))
             angle  = float(np.arctan2(vy, vx))
             cx, cy, cz = t["center"]
+            tid = int(t["id"])
+            behavior = (behaviors or {}).get(tid, "unknown")
             self._w.writerow([
                 ts_ms,
-                int(t["id"]),
+                tid,
                 int(float(cx) * 1000),   # m → mm
                 int(float(cy) * 1000),
                 int(float(cz) * 1000),
                 int(speed * 1000),        # m/s → mm/s
                 round(angle, 4),
                 round(angle, 4),
+                behavior,                 # 9th column — safe for legacy readers
             ])
         self._f.flush()
 
     def close(self):
         self._f.close()
+
+
+# ─── Behavior classifier ──────────────────────────────────────────────────────
+
+# Behavior-dependent marker colors: (r, g, b)
+_BEHAVIOR_COLORS = {
+    "walking":  (1.0,  0.55, 0.0),   # orange
+    "standing": (0.2,  0.4,  1.0),   # blue
+    "sitting":  (0.0,  0.85, 0.2),   # green
+    "talking":  (1.0,  0.0,  0.0),   # red
+    "unknown":  (0.65, 0.65, 0.65),  # gray
+}
+
+
+class BehaviorClassifier:
+    """
+    Per-track behavior classification using a sliding window of recent trajectory
+    features.  Pure trajectory/geometry — no neural network, no training data.
+
+    States:
+      unknown  — warm-up period; fewer than min_window_frames of history
+      walking  — mean speed over window > walk_speed_threshold (m/s)
+      standing — slow AND cluster z-extent >= standing_height_threshold (m)
+      sitting  — slow AND cluster z-extent < standing_height_threshold (m)
+      talking  — two low-speed tracks within talk_distance_threshold (m)
+                 for >= talk_duration_sec seconds (overrides standing/sitting)
+
+    Priority: talking > walking > sitting/standing > unknown
+
+    Hysteresis: a new label must persist for behavior_hold_frames consecutive
+    frames before the displayed label switches.
+    """
+
+    def __init__(self, cfg: dict):
+        self._enabled     = bool(cfg.get("enabled", True))
+        self._window      = int(cfg.get("window_frames", 30))
+        self._min_win     = int(cfg.get("min_window_frames", 15))
+        self._walk_spd    = float(cfg.get("walk_speed_threshold", 0.5))
+        self._stand_h     = float(cfg.get("standing_height_threshold", 1.2))
+        self._talk_d      = float(cfg.get("talk_distance_threshold", 1.5))
+        self._talk_dur    = float(cfg.get("talk_duration_sec", 30.0))
+        self._hold_frames = int(cfg.get("behavior_hold_frames", 5))
+
+        # per-track: deque of {x, y, z, z_extent, t}
+        self._windows:   Dict[int, deque] = {}
+        # per-track: (candidate_label, consecutive_count) for hysteresis
+        self._candidate: Dict[int, Tuple[str, int]] = {}
+        # per-track: currently displayed label (after hysteresis)
+        self._label:     Dict[int, str] = {}
+        # pair proximity tracking: frozenset({id1, id2}) -> wall_time first seen close
+        self._close_since: Dict[frozenset, float] = {}
+        # pairs currently classified as "talking"
+        self._talking_pairs: set = set()
+
+    def update(self, tracks: List[dict], wall_time: float) -> Dict[int, str]:
+        """
+        Update the classifier with this frame's confirmed tracks.
+
+        Returns: dict mapping track_id -> behavior label string
+        """
+        if not self._enabled:
+            return {t["id"]: "unknown" for t in tracks}
+
+        active_ids = {t["id"] for t in tracks}
+
+        # Clean up state for tracks that have disappeared
+        for dead in set(self._windows) - active_ids:
+            del self._windows[dead]
+            self._candidate.pop(dead, None)
+            self._label.pop(dead, None)
+
+        dead_pairs = [p for p in self._close_since if not p.issubset(active_ids)]
+        for p in dead_pairs:
+            del self._close_since[p]
+            self._talking_pairs.discard(p)
+
+        # Update sliding windows
+        for t in tracks:
+            tid = t["id"]
+            if tid not in self._windows:
+                self._windows[tid] = deque(maxlen=self._window)
+            self._windows[tid].append({
+                "x":        float(t["center"][0]),
+                "y":        float(t["center"][1]),
+                "z":        float(t["center"][2]),
+                "z_extent": float(t["size"][2]),   # cluster height (m)
+                "t":        wall_time,
+            })
+
+        # Compute raw label for each track
+        raw: Dict[int, str] = {}
+        for t in tracks:
+            tid = t["id"]
+            win = self._windows[tid]
+            if len(win) < self._min_win:
+                raw[tid] = "unknown"
+                continue
+
+            dt_total = win[-1]["t"] - win[0]["t"]
+            if dt_total <= 0.0:
+                raw[tid] = "unknown"
+                continue
+
+            # Mean speed from window (path length / elapsed time)
+            positions = [(w["x"], w["y"]) for w in win]
+            path_len = sum(
+                math.hypot(positions[i+1][0] - positions[i][0],
+                           positions[i+1][1] - positions[i][1])
+                for i in range(len(positions) - 1)
+            )
+            mean_speed = path_len / dt_total  # m/s
+
+            mean_z_extent = float(np.mean([w["z_extent"] for w in win]))
+
+            if mean_speed > self._walk_spd:
+                raw[tid] = "walking"
+            elif mean_z_extent >= self._stand_h:
+                raw[tid] = "standing"
+            else:
+                raw[tid] = "sitting"
+
+        # Pairwise talking detection — only among confirmed slow tracks
+        track_map  = {t["id"]: t for t in tracks}
+        slow_ids   = [tid for tid, lbl in raw.items()
+                      if lbl in ("standing", "sitting")]
+        active_pairs: set = set()
+
+        for i in range(len(slow_ids)):
+            for j in range(i + 1, len(slow_ids)):
+                id1, id2 = slow_ids[i], slow_ids[j]
+                c1 = track_map[id1]["center"]
+                c2 = track_map[id2]["center"]
+                horiz_dist = math.hypot(float(c1[0]) - float(c2[0]),
+                                        float(c1[1]) - float(c2[1]))
+                if horiz_dist < self._talk_d:
+                    pair = frozenset({id1, id2})
+                    active_pairs.add(pair)
+                    if pair not in self._close_since:
+                        self._close_since[pair] = wall_time
+                    elif wall_time - self._close_since[pair] >= self._talk_dur:
+                        self._talking_pairs.add(pair)
+
+        # Pairs that broke proximity → stop talking
+        for pair in list(self._close_since.keys()):
+            if pair not in active_pairs:
+                del self._close_since[pair]
+                self._talking_pairs.discard(pair)
+
+        # Override raw labels: talking > everything else
+        for pair in self._talking_pairs:
+            for tid in pair:
+                if tid in raw:
+                    raw[tid] = "talking"
+
+        # Apply hysteresis: label only switches after hold_frames consecutive frames
+        result: Dict[int, str] = {}
+        for t in tracks:
+            tid = t["id"]
+            new_raw = raw.get(tid, "unknown")
+
+            if tid not in self._label:
+                # First frame for this track — display immediately, no hysteresis
+                self._label[tid]     = new_raw
+                self._candidate[tid] = (new_raw, 1)
+                result[tid] = new_raw
+                continue
+
+            cand_lbl, cand_cnt = self._candidate.get(tid, (new_raw, 0))
+            if new_raw == cand_lbl:
+                cand_cnt += 1
+            else:
+                cand_lbl = new_raw
+                cand_cnt = 1
+            self._candidate[tid] = (cand_lbl, cand_cnt)
+
+            if cand_cnt >= self._hold_frames:
+                self._label[tid] = cand_lbl
+
+            result[tid] = self._label[tid]
+
+        return result
+
+    @staticmethod
+    def color(behavior: str) -> Tuple[float, float, float]:
+        return _BEHAVIOR_COLORS.get(behavior, _BEHAVIOR_COLORS["unknown"])
+
+    def count_summary(self, behaviors: Dict[int, str]) -> str:
+        """Short summary string for the periodic log line, e.g. 'walk=1 sit=2 talk=2'."""
+        counts: Dict[str, int] = {}
+        for lbl in behaviors.values():
+            counts[lbl] = counts.get(lbl, 0) + 1
+        parts = []
+        for lbl in ("walking", "standing", "sitting", "talking", "unknown"):
+            if counts.get(lbl, 0) > 0:
+                parts.append(f"{lbl[:4]}={counts[lbl]}")
+        return " ".join(parts)
 
 
 # ─── Tracking Node ────────────────────────────────────────────────────────────
@@ -352,6 +624,7 @@ class TrackingNode:
                  roi_cfg: dict,
                  filter_cfg: dict,
                  tracking_cfg: dict,
+                 behavior_cfg: dict,
                  csv_dir: Path):
 
         self.cluster_tol  = cluster_tol
@@ -362,12 +635,14 @@ class TrackingNode:
         self.roi_cfg      = roi_cfg
         self.filter_cfg   = filter_cfg
 
-        max_age        = int(tracking_cfg.get("max_age",   5))
-        min_hits       = int(tracking_cfg.get("min_hits",  3))
-        max_dist       = float(tracking_cfg.get("max_association_dist", 1.0))
+        max_age         = int(tracking_cfg.get("max_age",   5))
+        min_hits        = int(tracking_cfg.get("min_hits",  3))
+        max_dist        = float(tracking_cfg.get("max_association_dist", 1.0))
         suppress_frames = int(tracking_cfg.get("static_suppress_frames", 20))
-        suppress_dist  = float(tracking_cfg.get("static_suppress_dist",  0.30))
-        do_csv         = bool(tracking_cfg.get("csv_logging", True))
+        suppress_dist   = float(tracking_cfg.get("static_suppress_dist",  0.30))
+        do_csv          = bool(tracking_cfg.get("csv_logging", True))
+        direction_w     = float(tracking_cfg.get("direction_weight", 0.5))
+        direction_spd   = float(tracking_cfg.get("direction_min_speed", 0.3))
 
         self._frame_buf: deque = deque(maxlen=self.accum_frames)
         self._frame_count = 0
@@ -384,6 +659,8 @@ class TrackingNode:
             fps=self._fps,
             static_suppress_frames=suppress_frames,
             static_suppress_dist=suppress_dist,
+            direction_weight=direction_w,
+            direction_min_speed=direction_spd,
         )
 
         self.static_filter = StaticZoneFilter(
@@ -392,6 +669,8 @@ class TrackingNode:
             density_threshold=float(tracking_cfg.get("static_zone_density", 0.75)),
             min_history=int(tracking_cfg.get("static_zone_min_history", 15)),
         )
+
+        self.behavior_clf = BehaviorClassifier(behavior_cfg)
 
         self.csv_logger = ATCLogger(csv_dir) if do_csv else None
 
@@ -418,9 +697,11 @@ class TrackingNode:
         print(f"  Output: /tracked_boxes, /tracked_centers")
         print(f"  Tracker: max_age={max_age}  min_hits={min_hits}  "
               f"max_dist={max_dist}m  accum={self.accum_frames}frames")
+        print(f"  Direction: weight={direction_w}  min_speed={direction_spd}m/s")
         if roi_cfg.get("enabled"):
             print(f"  ROI:    x[{roi_cfg['x_min']},{roi_cfg['x_max']}]  "
                   f"y[{roi_cfg['y_min']},{roi_cfg['y_max']}]")
+        print(f"  Behavior: {'enabled' if behavior_cfg.get('enabled', True) else 'disabled'}")
 
     # ── callback ──────────────────────────────────────────────────────────────
 
@@ -465,20 +746,25 @@ class TrackingNode:
         # Track
         tracks = self.tracker.step(detections)
 
+        # Classify behaviors
+        behaviors = self.behavior_clf.update(tracks, t0)
+
         header = msg.get("header", {})
-        self._publish_tracked_boxes(tracks, header)
+        self._publish_tracked_boxes(tracks, behaviors, header)
         self._publish_tracked_centers(tracks, header)
 
         if self.csv_logger and tracks:
-            self.csv_logger.write(tracks, t0)
+            self.csv_logger.write(tracks, t0, behaviors)
 
         dt = time.time() - t0
         self._frame_count += 1
         if self._frame_count % 20 == 0:
             active = len(tracks)
+            bhv_summary = self.behavior_clf.count_summary(behaviors)
             print(f"[frame {self._frame_count:>4}]  "
                   f"pts={len(merged):>5}  det={len(detections):>2}  "
-                  f"tracks={active:>2}  fps={self._fps:.1f}  {dt*1000:.0f}ms")
+                  f"tracks={active:>2}  fps={self._fps:.1f}  {dt*1000:.0f}ms"
+                  + (f"  | {bhv_summary}" if bhv_summary else ""))
 
     # ── decode ────────────────────────────────────────────────────────────────
 
@@ -506,7 +792,8 @@ class TrackingNode:
 
     # ── publish markers ───────────────────────────────────────────────────────
 
-    def _publish_tracked_boxes(self, tracks: List[dict], header: dict):
+    def _publish_tracked_boxes(self, tracks: List[dict],
+                               behaviors: Dict[int, str], header: dict):
         stamp    = header.get("stamp",    {"sec": 0, "nanosec": 0})
         frame_id = header.get("frame_id", "livox_frame")
         markers  = []
@@ -517,9 +804,11 @@ class TrackingNode:
             cur_ids.add(tid)
             c  = t["center"].tolist()
             s  = t["size"].tolist()
-            r, g, b = track_color(tid)
 
-            # Box marker
+            behavior = behaviors.get(tid, "unknown")
+            r, g, b  = BehaviorClassifier.color(behavior)
+
+            # Box marker — color driven by behavior
             markers.append({
                 "header":    {"stamp": stamp, "frame_id": frame_id},
                 "ns":        "tracked_persons",
@@ -540,10 +829,10 @@ class TrackingNode:
                 "lifetime": {"sec": 0, "nanosec": 400000000},
             })
 
-            # Text marker — track ID label above box
-            label_z = float(c[2]) + max(float(s[2]) / 2.0, 0.05) + 0.2
+            # Text marker — ID + behavior label, same color as box
+            label_z  = float(c[2]) + max(float(s[2]) / 2.0, 0.05) + 0.2
             coasting = t["time_since_update"] > 0
-            label    = f"#{tid}{'*' if coasting else ''}"
+            label    = f"#{tid}{'*' if coasting else ''} {behavior}"
             markers.append({
                 "header":    {"stamp": stamp, "frame_id": frame_id},
                 "ns":        "tracked_persons",
@@ -556,7 +845,7 @@ class TrackingNode:
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 },
                 "scale":    {"x": 0.0, "y": 0.0, "z": 0.25},
-                "color":    {"r": 1.0, "g": 1.0, "b": 1.0, "a": 0.9},
+                "color":    {"r": r, "g": g, "b": b, "a": 0.95},
                 "text":     label,
                 "lifetime": {"sec": 0, "nanosec": 400000000},
             })
@@ -667,6 +956,7 @@ if __name__ == "__main__":
     roi_cfg        = {}
     filter_cfg     = {}
     tracking_cfg   = {}
+    behavior_cfg   = {}
 
     if args.config is not None:
         try:
@@ -684,6 +974,7 @@ if __name__ == "__main__":
         roi_cfg        = node_cfg.get("roi",            {})
         filter_cfg     = node_cfg.get("cluster_filter", {})
         tracking_cfg   = node_cfg.get("tracking",       {})
+        behavior_cfg   = node_cfg.get("behavior",       {})
 
     if jetson_ip is None:
         jetson_ip = "172.26.42.167"
@@ -730,6 +1021,7 @@ if __name__ == "__main__":
         roi_cfg=roi_cfg,
         filter_cfg=filter_cfg,
         tracking_cfg=tracking_cfg,
+        behavior_cfg=behavior_cfg,
         csv_dir=csv_dir,
     )
     node.spin()
