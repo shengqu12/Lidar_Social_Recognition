@@ -69,29 +69,72 @@ def ssh_check(cfg: dict, cmd: str) -> bool:
     return result.returncode == 0
 
 
+def _kill_pattern(cfg: dict, pattern: str, label: str) -> bool:
+    """
+    Kill all remote processes matching pattern.  SIGTERM first, then verify
+    with pgrep, then SIGKILL any survivors.  Loops up to 3 times.
+    Returns True when zero matches remain; False if processes refused to die.
+    """
+    for attempt in range(1, 4):
+        ssh_run(cfg, f"pkill -f '{pattern}' 2>/dev/null || true")
+        time.sleep(0.5)
+
+        out, _ = ssh_run(cfg, f"pgrep -d ',' -f '{pattern}' 2>/dev/null || true")
+        pids = [p for p in out.split(",") if p.strip()]
+        if not pids:
+            return True
+
+        print(f"  {label}: {len(pids)} survivor(s) after attempt {attempt}/3 — "
+              f"SIGKILL PIDs {', '.join(pids)}")
+        ssh_run(cfg, f"kill -9 {' '.join(pids)} 2>/dev/null || true")
+        time.sleep(0.5)
+
+    out, _ = ssh_run(cfg, f"pgrep -d ',' -f '{pattern}' 2>/dev/null || true")
+    pids = [p for p in out.split(",") if p.strip()]
+    if pids:
+        print(f"  ERROR: {label} refused to die — PIDs still alive: {', '.join(pids)}")
+        return False
+    return True
+
+
+def _count_procs(cfg: dict, pattern: str) -> int:
+    """Return the number of remote processes matching pattern (0 if none)."""
+    out, _ = ssh_run(cfg, f"pgrep -c -f '{pattern}' 2>/dev/null || echo 0")
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
 # ─── Stop all services ────────────────────────────────────────────────────────
 
 def stop_all(cfg: dict) -> bool:
     """
     Kill every pipeline process and guarantee the rosbridge port is free.
-    Tries up to 3 times with direct PID kill if pkill is not enough.
-    Returns True on success, False if the port is still occupied after 3 tries.
+    Each process family is killed by pattern, verified with pgrep, and
+    SIGKILL'd individually if needed (up to 3 rounds per pattern).
+    Returns True when all patterns are gone and the port is free.
     """
     ip = cfg["jetson_ip"]
     port = cfg["rosbridge_port"]
     print(f"Stopping all services on {ip}...")
 
-    # Broad pkill sweep — patterns cover both launch wrappers and actual nodes
-    kill_cmd = (
-        "pkill -f rosbridge_websocket 2>/dev/null || true; "
-        "pkill -f rosapi             2>/dev/null || true; "
-        "pkill -f livox_ros_driver2  2>/dev/null || true; "
-        "pkill -f statistical_bg_node 2>/dev/null || true; "
-        "pkill -f msg_MID360_launch  2>/dev/null || true; "
-        "pkill -f rosbridge_server   2>/dev/null || true"
-    )
-    ssh_run(cfg, kill_cmd)
-    time.sleep(2)
+    patterns = [
+        ("rosbridge_websocket", "rosbridge_websocket"),
+        ("rosbridge_server",    "rosbridge_server"),
+        ("rosapi",              "rosapi"),
+        ("livox_ros_driver2",   "livox_driver"),
+        ("statistical_bg_node.py", "statistical_bg"),
+        ("msg_MID360_launch",   "msg_MID360_launch"),
+    ]
+
+    all_clean = True
+    for pattern, label in patterns:
+        ok = _kill_pattern(cfg, pattern, label)
+        if not ok:
+            all_clean = False
+
+    time.sleep(1)
 
     # Reset ROS2 daemon to clear stale node/topic cache
     print("  Resetting ROS2 daemon...")
@@ -107,7 +150,11 @@ def stop_all(cfg: dict) -> bool:
         out, _ = ssh_run(cfg, f"ss -tlnp | grep :{port}")
         if not out.strip():
             print(f"  Port {port} is free.")
-            return True
+            if not all_clean:
+                print("  WARNING: Some processes refused pkill — check output above.")
+            else:
+                print("  All services stopped.")
+            return all_clean
 
         print(f"  Port {port} still occupied (attempt {attempt}/3)...")
         pid_out, _ = ssh_run(
@@ -129,8 +176,11 @@ def stop_all(cfg: dict) -> bool:
               f"grep -oP 'pid=\\\\K[0-9]+')\"")
         return False
 
-    print("  All services stopped.")
-    return True
+    if not all_clean:
+        print("  WARNING: Some processes refused pkill — check output above.")
+    else:
+        print("  All services stopped.")
+    return all_clean
 
 
 # ─── Individual service starts ────────────────────────────────────────────────
@@ -189,6 +239,25 @@ def start_lidar_driver(cfg: dict) -> bool:
 def start_bg_removal(cfg: dict) -> bool:
     print("  [3/3] Starting statistical background removal...")
 
+    # Safety net: even though stop_all() already ran, confirm zero instances
+    # before launching so that a half-dead process can never cause accumulation.
+    out, _ = ssh_run(cfg,
+        "pgrep -d ',' -f 'statistical_bg_node.py' 2>/dev/null || true")
+    stale = [p for p in out.split(",") if p.strip()]
+    if stale:
+        print(f"  [3/3] WARNING: {len(stale)} stale statistical_bg_node.py "
+              f"process(es) found — killing before launch (PIDs: {', '.join(stale)})")
+        ssh_run(cfg, f"kill -9 {' '.join(stale)} 2>/dev/null || true")
+        time.sleep(1)
+        out, _ = ssh_run(cfg,
+            "pgrep -d ',' -f 'statistical_bg_node.py' 2>/dev/null || true")
+        still_alive = [p for p in out.split(",") if p.strip()]
+        if still_alive:
+            print(f"  [3/3] ERROR: Could not kill stale processes — "
+                  f"PIDs {', '.join(still_alive)} still alive. Aborting BG launch.")
+            return False
+        print("  [3/3] Stale processes cleared.")
+
     model = cfg["bg_model_path"]
     if not ssh_check(cfg, f"test -f {model}"):
         print(f"\n  ERROR: Background model not found at {model} on Jetson")
@@ -241,20 +310,41 @@ def check_status(cfg: dict) -> None:
     print(f"Status on {cfg['jetson_user']}@{ip}:")
     print()
 
-    if ssh_check(cfg, f"ss -tlnp | grep -q :{port}"):
-        print(f"  rosbridge       OK  (port {port} open)")
-    else:
-        print(f"  rosbridge       FAIL  (port {port} not listening)")
+    any_duplicate = False
 
-    if ssh_check(cfg, "pgrep -f livox_ros_driver2 > /dev/null"):
-        print(f"  LiDAR driver    OK  (livox_ros_driver2 running)")
-    else:
-        print(f"  LiDAR driver    FAIL")
+    def _status_line(label: str, pattern: str, expected: int = 1) -> int:
+        nonlocal any_duplicate
+        count = _count_procs(cfg, pattern)
+        proc_word = "process " if count == 1 else "processes"
+        if count == expected:
+            print(f"  {label:<22}{count} {proc_word}  OK")
+        elif count > expected:
+            any_duplicate = True
+            print(f"  {label:<22}{count} {proc_word}  ✗  DUPLICATES DETECTED")
+        else:
+            print(f"  {label:<22}{count} {proc_word}  FAIL")
+        return count
 
-    if ssh_check(cfg, "pgrep -f statistical_bg_node > /dev/null"):
-        print(f"  BG removal      OK  (statistical_bg_node running)")
+    # rosbridge: check process count AND port
+    rb_count = (_count_procs(cfg, "rosbridge_websocket") +
+                _count_procs(cfg, "rosbridge_server"))
+    port_open = ssh_check(cfg, f"ss -tlnp | grep -q :{port}")
+    rb_word = "process " if rb_count == 1 else "processes"
+    if rb_count == 1 and port_open:
+        print(f"  {'rosbridge:':<22}{rb_count} {rb_word}  OK  (port {port} open)")
+    elif rb_count > 1:
+        any_duplicate = True
+        print(f"  {'rosbridge:':<22}{rb_count} {rb_word}  ✗  DUPLICATES DETECTED")
     else:
-        print(f"  BG removal      FAIL")
+        print(f"  {'rosbridge:':<22}{rb_count} {rb_word}  FAIL  (port {port} not listening)")
+
+    _status_line("livox_driver:",     "livox_ros_driver2")
+    _status_line("statistical_bg:",   "statistical_bg_node.py")
+    _status_line("msg_MID360_launch:", "msg_MID360_launch")
+
+    if any_duplicate:
+        print()
+        print("  *** DUPLICATE PROCESSES DETECTED — run --stop then --start ***")
 
     print()
     print(f"  Foxglove:  ws://{ip}:{port}")
