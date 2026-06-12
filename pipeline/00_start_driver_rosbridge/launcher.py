@@ -69,6 +69,24 @@ def ssh_check(cfg: dict, cmd: str) -> bool:
     return result.returncode == 0
 
 
+def _pgrep_real_pids(cfg: dict, pattern: str) -> list[str]:
+    """Return PIDs of remote processes matching pattern, excluding pgrep/grep/ssh wrappers.
+
+    pgrep -f matches the pattern against every process's full cmdline, which
+    includes the transient ssh/bash/pgrep processes spawned to run the check
+    itself.  Piping through grep -v removes those self-matches so only real
+    target processes are returned.
+    """
+    out, _ = ssh_run(
+        cfg,
+        f"pgrep -af '{pattern}' 2>/dev/null"
+        f" | grep -v -E 'pgrep|grep|ssh'"
+        f" | awk '{{print $1}}'"
+        f" || true"
+    )
+    return [p for p in out.splitlines() if p.strip()]
+
+
 def _kill_pattern(cfg: dict, pattern: str, label: str) -> bool:
     """
     Kill all remote processes matching pattern.  SIGTERM first, then verify
@@ -79,8 +97,7 @@ def _kill_pattern(cfg: dict, pattern: str, label: str) -> bool:
         ssh_run(cfg, f"pkill -f '{pattern}' 2>/dev/null || true")
         time.sleep(0.5)
 
-        out, _ = ssh_run(cfg, f"pgrep -d ',' -f '{pattern}' 2>/dev/null || true")
-        pids = [p for p in out.split(",") if p.strip()]
+        pids = _pgrep_real_pids(cfg, pattern)
         if not pids:
             return True
 
@@ -89,8 +106,7 @@ def _kill_pattern(cfg: dict, pattern: str, label: str) -> bool:
         ssh_run(cfg, f"kill -9 {' '.join(pids)} 2>/dev/null || true")
         time.sleep(0.5)
 
-    out, _ = ssh_run(cfg, f"pgrep -d ',' -f '{pattern}' 2>/dev/null || true")
-    pids = [p for p in out.split(",") if p.strip()]
+    pids = _pgrep_real_pids(cfg, pattern)
     if pids:
         print(f"  ERROR: {label} refused to die — PIDs still alive: {', '.join(pids)}")
         return False
@@ -99,11 +115,7 @@ def _kill_pattern(cfg: dict, pattern: str, label: str) -> bool:
 
 def _count_procs(cfg: dict, pattern: str) -> int:
     """Return the number of remote processes matching pattern (0 if none)."""
-    out, _ = ssh_run(cfg, f"pgrep -c -f '{pattern}' 2>/dev/null || echo 0")
-    try:
-        return int(out.strip())
-    except ValueError:
-        return 0
+    return len(_pgrep_real_pids(cfg, pattern))
 
 
 # ─── Stop all services ────────────────────────────────────────────────────────
@@ -241,17 +253,13 @@ def start_bg_removal(cfg: dict) -> bool:
 
     # Safety net: even though stop_all() already ran, confirm zero instances
     # before launching so that a half-dead process can never cause accumulation.
-    out, _ = ssh_run(cfg,
-        "pgrep -d ',' -f 'statistical_bg_node.py' 2>/dev/null || true")
-    stale = [p for p in out.split(",") if p.strip()]
+    stale = _pgrep_real_pids(cfg, "statistical_bg_node.py")
     if stale:
         print(f"  [3/3] WARNING: {len(stale)} stale statistical_bg_node.py "
               f"process(es) found — killing before launch (PIDs: {', '.join(stale)})")
         ssh_run(cfg, f"kill -9 {' '.join(stale)} 2>/dev/null || true")
         time.sleep(1)
-        out, _ = ssh_run(cfg,
-            "pgrep -d ',' -f 'statistical_bg_node.py' 2>/dev/null || true")
-        still_alive = [p for p in out.split(",") if p.strip()]
+        still_alive = _pgrep_real_pids(cfg, "statistical_bg_node.py")
         if still_alive:
             print(f"  [3/3] ERROR: Could not kill stale processes — "
                   f"PIDs {', '.join(still_alive)} still alive. Aborting BG launch.")
