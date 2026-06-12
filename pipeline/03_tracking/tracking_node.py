@@ -66,6 +66,62 @@ sys.path.insert(0, str(_THIRD_PARTY))
 from ab3dmot_tracking import Kalman3D, Track, MultiObjectTracker3D  # noqa: E402
 
 
+# ─── Static zone filter (detection-level) ────────────────────────────────────
+
+class StaticZoneFilter:
+    """
+    Filters out detections that appear consistently at the same location.
+
+    Algorithm: maintain a rolling window of the last `history_frames` detection
+    center lists.  A new detection is considered static if, in at least
+    `density_threshold` fraction of the history frames, at least one past
+    detection center falls within `radius` metres of it.
+
+    This catches fixed furniture/equipment that the background model misses,
+    without relying on track IDs (so track flickering doesn't reset state).
+    """
+
+    def __init__(self,
+                 history_frames: int = 30,
+                 radius: float = 0.5,
+                 density_threshold: float = 0.75,
+                 min_history: int = 15):
+        self._history: deque = deque(maxlen=history_frames)
+        self._radius    = float(radius)
+        self._threshold = float(density_threshold)
+        self._min_history = int(min_history)
+
+    def filter(self, detections: List[dict]) -> List[dict]:
+        """Return only detections that are NOT in a persistent static zone."""
+        centers_now = [
+            (float(d["center"][0]), float(d["center"][1]))
+            for d in detections
+        ]
+
+        n_history = len(self._history)
+        filtered = []
+
+        for i, (cx, cy) in enumerate(centers_now):
+            if n_history < self._min_history:
+                filtered.append(detections[i])
+            else:
+                frames_with_nearby = 0
+                for past_centers in self._history:
+                    for px, py in past_centers:
+                        if np.hypot(cx - px, cy - py) < self._radius:
+                            frames_with_nearby += 1
+                            break  # one match per historical frame is enough
+                density = frames_with_nearby / n_history
+                if density < self._threshold:
+                    filtered.append(detections[i])
+
+        # Record current centers AFTER filtering (only non-static detections
+        # should seed future history — avoids reinforcing stale zones if the
+        # room layout changes)
+        self._history.append(centers_now)
+        return filtered
+
+
 # ─── Color helper ─────────────────────────────────────────────────────────────
 
 _GOLDEN = 0.618033988749895
@@ -85,14 +141,18 @@ class LiveTracker:
     - Measurement variance set to reflect ~0.3 m bbox-center noise
     - Association gate corresponding to max_association_dist metres
     - IoU disabled (unreliable for sparse overhead blobs)
-    - min_hits / max_age from config
+    - min_hits / max_age lifecycle from config
+    - Static suppression: tracks that don't displace >= static_suppress_dist metres
+      over static_suppress_frames frames are classified as furniture and removed
     """
 
     def __init__(self,
                  max_age: int = 5,
                  min_hits: int = 3,
                  max_association_dist: float = 1.0,
-                 fps: float = 10.0):
+                 fps: float = 10.0,
+                 static_suppress_frames: int = 20,
+                 static_suppress_dist: float = 0.30):
         # Kalman dt from observed frame rate
         dt = 1.0 / max(1.0, fps)
 
@@ -104,6 +164,10 @@ class LiveTracker:
         maha_gate = (max_association_dist ** 2) / meas_var * 1.5
 
         self._min_hits = int(min_hits)
+        self._suppress_frames = int(static_suppress_frames)
+        self._suppress_dist   = float(static_suppress_dist)
+        # position history per track: track_id -> deque of (x, y) arrays
+        self._pos_history: dict = {}
 
         self._tracker = MultiObjectTracker3D(
             dt=dt,
@@ -169,13 +233,13 @@ class LiveTracker:
         # so users never see flicker from single-frame ghost detections.
         outputs = [o for o in outputs if o["hits"] >= self._min_hits]
 
-        tracks = []
+        raw_tracks = []
         for o in outputs:
             box   = o["box"]   # [x,y,z,dx,dy,dz,yaw]
             trk   = self._get_track(o["id"])
             vx    = float(trk.kf.x[3, 0]) if trk else 0.0
             vy    = float(trk.kf.x[4, 0]) if trk else 0.0
-            tracks.append({
+            raw_tracks.append({
                 "id":                o["id"],
                 "center":            np.array(box[:3], dtype=np.float32),
                 "size":              np.array(box[3:6], dtype=np.float32),
@@ -185,6 +249,33 @@ class LiveTracker:
                 "hits":              o["hits"],
                 "time_since_update": o["time_since_update"],
             })
+
+        # Update position history and apply static suppression.
+        # A track whose maximum displacement over the last N positions is less
+        # than the threshold is classified as a stationary object (furniture)
+        # and excluded from output.
+        active_ids = {t["id"] for t in raw_tracks}
+        dead_ids   = set(self._pos_history.keys()) - active_ids
+        for dead in dead_ids:
+            del self._pos_history[dead]
+
+        tracks = []
+        for t in raw_tracks:
+            tid = t["id"]
+            xy  = t["center"][:2].copy()
+            if tid not in self._pos_history:
+                self._pos_history[tid] = deque(maxlen=self._suppress_frames)
+            self._pos_history[tid].append(xy)
+
+            hist = self._pos_history[tid]
+            if len(hist) >= self._suppress_frames:
+                positions    = np.array(list(hist))
+                displacement = float(np.linalg.norm(positions - positions[0], axis=1).max())
+                if displacement < self._suppress_dist:
+                    continue  # static object — suppress
+
+            tracks.append(t)
+
         return tracks
 
     def _get_track(self, track_id: int) -> Optional[object]:
@@ -271,10 +362,12 @@ class TrackingNode:
         self.roi_cfg      = roi_cfg
         self.filter_cfg   = filter_cfg
 
-        max_age   = int(tracking_cfg.get("max_age",   5))
-        min_hits  = int(tracking_cfg.get("min_hits",  3))
-        max_dist  = float(tracking_cfg.get("max_association_dist", 1.0))
-        do_csv    = bool(tracking_cfg.get("csv_logging", True))
+        max_age        = int(tracking_cfg.get("max_age",   5))
+        min_hits       = int(tracking_cfg.get("min_hits",  3))
+        max_dist       = float(tracking_cfg.get("max_association_dist", 1.0))
+        suppress_frames = int(tracking_cfg.get("static_suppress_frames", 20))
+        suppress_dist  = float(tracking_cfg.get("static_suppress_dist",  0.30))
+        do_csv         = bool(tracking_cfg.get("csv_logging", True))
 
         self._frame_buf: deque = deque(maxlen=self.accum_frames)
         self._frame_count = 0
@@ -289,6 +382,15 @@ class TrackingNode:
             min_hits=min_hits,
             max_association_dist=max_dist,
             fps=self._fps,
+            static_suppress_frames=suppress_frames,
+            static_suppress_dist=suppress_dist,
+        )
+
+        self.static_filter = StaticZoneFilter(
+            history_frames=int(tracking_cfg.get("static_zone_history", 30)),
+            radius=float(tracking_cfg.get("static_zone_radius", 0.5)),
+            density_threshold=float(tracking_cfg.get("static_zone_density", 0.75)),
+            min_history=int(tracking_cfg.get("static_zone_min_history", 15)),
         )
 
         self.csv_logger = ATCLogger(csv_dir) if do_csv else None
@@ -356,6 +458,9 @@ class TrackingNode:
             roi_cfg=None,       # already applied above
             filter_cfg=self.filter_cfg,
         )
+
+        # Remove detections that are persistently at a static location (furniture)
+        detections = self.static_filter.filter(detections)
 
         # Track
         tracks = self.tracker.step(detections)

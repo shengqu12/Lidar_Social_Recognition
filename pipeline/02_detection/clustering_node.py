@@ -40,8 +40,11 @@ from scipy.spatial import KDTree
 
 def apply_roi(pts: np.ndarray, roi_cfg: dict) -> np.ndarray:
     """
-    Crop points to the axis-aligned ROI box defined in roi_cfg.
-    Returns a (M, 3) array; may be empty.
+    Crop points to the axis-aligned ROI box, then remove any exclusion zones.
+
+    exclusion_zones (optional list in roi_cfg):
+        [{cx, cy, radius}, ...]  — circular XY masks for known static objects
+        that the background model doesn't cover (furniture, equipment).
     """
     if not roi_cfg.get("enabled", False) or len(pts) == 0:
         return pts
@@ -50,6 +53,10 @@ def apply_roi(pts: np.ndarray, roi_cfg: dict) -> np.ndarray:
         (pts[:, 1] >= roi_cfg["y_min"]) & (pts[:, 1] <= roi_cfg["y_max"]) &
         (pts[:, 2] >= roi_cfg["z_min"]) & (pts[:, 2] <= roi_cfg["z_max"])
     )
+    for zone in roi_cfg.get("exclusion_zones", []):
+        cx, cy, r = float(zone["cx"]), float(zone["cy"]), float(zone["radius"])
+        dist_sq = (pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2
+        mask &= dist_sq > r * r
     return pts[mask]
 
 

@@ -16,7 +16,8 @@ nodes:
       max_persons: 10
       bbox_alpha: 0.4        # 0.0 = fully transparent, 1.0 = fully opaque
       bbox_color: [1.0, 0.5, 0.0]  # RGB: orange
-      accum_frames: 3        # buffer last N frames before clustering (1 = off)
+      accum_frames: 1        # 1 = no accumulation (set to 3 after background model rebuild)
+                             # accum_frames=3 amplifies background noise until model is updated
     roi:
       enabled: true
       x_min:  0.3
@@ -25,6 +26,16 @@ nodes:
       y_max: -0.7
       z_min: -2.5
       z_max: -0.5
+      exclusion_zones:        # static objects the background model does not cover
+        # Identified by roi_calibrate.py on 2026-06-12 (empty scene, accum_frames=3).
+        # PERMANENT FIX: rebuild the background model once the room is stable:
+        #   python3 pipeline/00_start_driver_rosbridge/rebuild_background.py
+        - cx: 1.56
+          cy: -1.67
+          radius: 0.75
+        - cx: 2.54
+          cy: -1.91
+          radius: 0.80
     cluster_filter:
       min_xy_size: 0.15      # reject thin wall-line clusters
       max_xy_size: 1.2       # reject furniture / large-object clusters
@@ -34,6 +45,12 @@ nodes:
       min_hits: 3            # frames before a new track is confirmed/output
       max_association_dist: 1.0   # metres; detection→track gate
       csv_logging: true
+      static_suppress_frames: 20  # evaluate stationarity over this many frames
+      static_suppress_dist: 0.30  # suppress track if total displacement < this (m)
+      static_zone_history: 30     # detection frames to build static-zone map
+      static_zone_radius: 0.5     # metres; detections within this of a static zone are rejected
+      static_zone_density: 0.75   # fraction of history frames that must have a nearby detection
+      static_zone_min_history: 15 # frames before static-zone filter activates
 
   # node2 — Mid-360S on 192.168.1.144, Jetson at 172.26.165.1 (uncomment when ready)
   # node2:
