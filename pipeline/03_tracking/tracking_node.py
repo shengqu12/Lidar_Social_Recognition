@@ -17,7 +17,7 @@ from the third-party AB3DMOT implementation.
 Usage:
     conda activate livox
     python3 pipeline/03_tracking/tracking_node.py \\
-        --config pipeline/00_start_driver_rosbridge/nodes_config.yaml \\
+        --config config/nodes_config.yaml \\
         --node node1
 """
 

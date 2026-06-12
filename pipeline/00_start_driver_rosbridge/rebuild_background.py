@@ -281,7 +281,7 @@ def main():
     # Find project root relative to this script
     script_dir = Path(__file__).parent
     project_root = script_dir.parent.parent
-    default_config = str(script_dir / "nodes_config.yaml")
+    default_config = str(project_root / "config" / "nodes_config.yaml")
 
     parser = argparse.ArgumentParser(
         description="Rebuild statistical background model for LiDAR pipeline",

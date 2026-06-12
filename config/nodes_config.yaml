@@ -1,0 +1,49 @@
+nodes:
+  node1:
+    jetson_ip: 172.26.42.167
+    jetson_user: kelrod
+    rosbridge_port: 9090
+    lidar_topic: /livox/lidar
+    foreground_topic: /livox/lidar_foreground
+    bg_model_path: ~/background_statistical_node1.npz
+    bg_sigma: 2.0
+    bg_z_min: -2.8
+    bg_z_max: -0.5
+    clustering:
+      cluster_tol: 0.6
+      min_points: 4
+      max_points: 5000
+      max_persons: 10
+      bbox_alpha: 0.4
+      bbox_color: [1.0, 0.5, 0.0]
+      accum_frames: 2
+      exclusion_zones:
+        - cx: 1.56
+          cy: -1.67
+          radius: 0.75
+        - cx: 2.54
+          cy: -1.91
+          radius: 0.80
+    cluster_filter:
+      min_xy_size: 0.10
+      max_xy_size: 1.0
+      max_aspect_ratio: 4.0
+    roi:
+      enabled: true
+      x_min: 0.3
+      x_max: 8.0
+      y_min: -5.0
+      y_max: -0.7
+      z_min: -2.5
+      z_max: -0.5
+    tracking:
+      max_age: 8
+      min_hits: 2
+      max_association_dist: 1.0
+      csv_logging: true
+      static_suppress_frames: 20
+      static_suppress_dist: 0.30
+      static_zone_history: 30
+      static_zone_radius: 0.5
+      static_zone_density: 0.75
+      static_zone_min_history: 15

@@ -50,11 +50,13 @@ Livox Mid-360 (ceiling-mounted, inverted)
 
 ```
 lidar_social_recognition/
+├── config/
+│   └── nodes_config.yaml            # Node-specific settings (Jetson IPs, topics, params)
 ├── pipeline/
 │   ├── 00_start_driver_rosbridge/   # One-script launcher: rosbridge + LiDAR driver + BG node on Jetson
 │   ├── 01_background_removal/       # Statistical BG model builder + ROS2 filtering node
 │   ├── 02_detection/                # Euclidean clustering node (runs locally via roslibpy)
-│   ├── 03_tracking/                 # Pending — AB3DMOT tracker (no source files yet)
+│   ├── 03_tracking/                 # AB3DMOT multi-object tracker
 │   ├── 04_encounter_detection/      # Proximity + heading + deceleration encounter detector
 │   └── 05_visualization/            # ROS2 node: replay .bin frames + detection boxes in Foxglove
 ├── eval/

@@ -394,7 +394,7 @@ def launch_tracking_local(cfg: dict, config_path: str, node_name: str) -> None:
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    default_config = str(Path(__file__).parent / "nodes_config.yaml")
+    default_config = str(Path(__file__).parent.parent.parent / "config" / "nodes_config.yaml")
 
     parser = argparse.ArgumentParser(
         description="LiDAR Social Recognition Pipeline Launcher",
