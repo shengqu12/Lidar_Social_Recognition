@@ -11,7 +11,7 @@ nodes:
     bg_z_max: -0.5
     clustering:
       cluster_tol: 0.6
-      min_points: 10
+      min_points: 20
       max_points: 5000
       max_persons: 10
       bbox_alpha: 0.4
@@ -37,7 +37,7 @@ nodes:
       z_min: -2.5
       z_max: -0.5
     tracking:
-      max_age: 15
+      max_age: 8
       min_hits: 3
       max_association_dist: 0.8
       csv_logging: true
@@ -49,6 +49,7 @@ nodes:
       static_zone_min_history: 15
       direction_weight: 0.5
       direction_min_speed: 0.3
+      coast_velocity_decay: 0.6
     behavior:
       enabled: true
       window_frames: 30

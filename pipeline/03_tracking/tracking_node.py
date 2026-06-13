@@ -217,7 +217,8 @@ class LiveTracker:
                  static_suppress_frames: int = 20,
                  static_suppress_dist: float = 0.30,
                  direction_weight: float = 0.5,
-                 direction_min_speed: float = 0.3):
+                 direction_min_speed: float = 0.3,
+                 coast_velocity_decay: float = 1.0):
         # Kalman dt from observed frame rate
         dt = 1.0 / max(1.0, fps)
 
@@ -231,6 +232,7 @@ class LiveTracker:
         self._min_hits = int(min_hits)
         self._suppress_frames = int(static_suppress_frames)
         self._suppress_dist   = float(static_suppress_dist)
+        self._coast_decay     = float(coast_velocity_decay)
         # position history per track: track_id -> deque of (x, y) arrays
         self._pos_history: dict = {}
 
@@ -293,6 +295,16 @@ class LiveTracker:
             det_scores = np.ones(len(detections), dtype=np.float32)
 
         outputs = self._tracker.step(det_boxes, det_scores)
+
+        # Dampen velocity of coasting (unmatched) tracks to prevent forward-drift
+        # overshoot when a person stops. Kalman state: [x,y,z,vx,vy,vz] — vx
+        # at index 3, vy at index 4. After step(), matched tracks have
+        # time_since_update=0; coasting tracks have time_since_update>=1.
+        if self._coast_decay < 1.0:
+            for trk in self._tracker.tracks:
+                if trk.time_since_update > 0:
+                    trk.kf.x[3, 0] *= self._coast_decay
+                    trk.kf.x[4, 0] *= self._coast_decay
 
         # Only output tracks that have been confirmed (hits >= min_hits).
         # The third-party tracker outputs all freshly-associated tracks regardless
@@ -458,6 +470,9 @@ class BehaviorClassifier:
         self._close_since: Dict[frozenset, float] = {}
         # pairs currently classified as "talking"
         self._talking_pairs: set = set()
+        # incremental path-length cache: avoids O(window) recompute each frame
+        self._path_segs: Dict[int, deque] = {}   # segment lengths, maxlen=window-1
+        self._path_lens: Dict[int, float] = {}   # running sum of current window segments
 
     def update(self, tracks: List[dict], wall_time: float) -> Dict[int, str]:
         """
@@ -475,22 +490,37 @@ class BehaviorClassifier:
             del self._windows[dead]
             self._candidate.pop(dead, None)
             self._label.pop(dead, None)
+            self._path_segs.pop(dead, None)
+            self._path_lens.pop(dead, None)
 
         dead_pairs = [p for p in self._close_since if not p.issubset(active_ids)]
         for p in dead_pairs:
             del self._close_since[p]
             self._talking_pairs.discard(p)
 
-        # Update sliding windows
+        # Update sliding windows with incremental path-length maintenance
         for t in tracks:
             tid = t["id"]
             if tid not in self._windows:
                 self._windows[tid] = deque(maxlen=self._window)
+                self._path_segs[tid] = deque(maxlen=max(1, self._window - 1))
+                self._path_lens[tid] = 0.0
+            win = self._windows[tid]
+            if len(win) > 0:
+                prev = win[-1]
+                new_seg = math.hypot(float(t["center"][0]) - prev["x"],
+                                     float(t["center"][1]) - prev["y"])
+                segs = self._path_segs[tid]
+                if len(segs) == segs.maxlen:
+                    # oldest segment is about to be auto-dropped — subtract it first
+                    self._path_lens[tid] -= segs[0]
+                segs.append(new_seg)
+                self._path_lens[tid] += new_seg
             self._windows[tid].append({
                 "x":        float(t["center"][0]),
                 "y":        float(t["center"][1]),
                 "z":        float(t["center"][2]),
-                "z_extent": float(t["size"][2]),   # cluster height (m)
+                "z_extent": float(t["size"][2]),
                 "t":        wall_time,
             })
 
@@ -508,14 +538,8 @@ class BehaviorClassifier:
                 raw[tid] = "unknown"
                 continue
 
-            # Mean speed from window (path length / elapsed time)
-            positions = [(w["x"], w["y"]) for w in win]
-            path_len = sum(
-                math.hypot(positions[i+1][0] - positions[i][0],
-                           positions[i+1][1] - positions[i][1])
-                for i in range(len(positions) - 1)
-            )
-            mean_speed = path_len / dt_total  # m/s
+            # Mean speed using incremental path-length cache (O(1) per track)
+            mean_speed = self._path_lens[tid] / dt_total
 
             mean_z_extent = float(np.mean([w["z_extent"] for w in win]))
 
@@ -643,6 +667,7 @@ class TrackingNode:
         do_csv          = bool(tracking_cfg.get("csv_logging", True))
         direction_w     = float(tracking_cfg.get("direction_weight", 0.5))
         direction_spd   = float(tracking_cfg.get("direction_min_speed", 0.3))
+        coast_decay     = float(tracking_cfg.get("coast_velocity_decay", 1.0))
 
         self._frame_buf: deque = deque(maxlen=self.accum_frames)
         self._frame_count = 0
@@ -661,6 +686,7 @@ class TrackingNode:
             static_suppress_dist=suppress_dist,
             direction_weight=direction_w,
             direction_min_speed=direction_spd,
+            coast_velocity_decay=coast_decay,
         )
 
         self.static_filter = StaticZoneFilter(
@@ -806,7 +832,11 @@ class TrackingNode:
             s  = t["size"].tolist()
 
             behavior = behaviors.get(tid, "unknown")
-            r, g, b  = BehaviorClassifier.color(behavior)
+            if behavior != "unknown":
+                r, g, b = BehaviorClassifier.color(behavior)
+            else:
+                # warm-up or disabled — use per-ID color so boxes stay distinct
+                r, g, b = track_color(tid)
 
             # Box marker — color driven by behavior
             markers.append({
@@ -944,6 +974,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_age",     type=int,   default=None)
     parser.add_argument("--min_hits",    type=int,   default=None)
     parser.add_argument("--max_assoc_dist", type=float, default=None)
+    parser.add_argument("--coast_velocity_decay", type=float, default=None)
     parser.add_argument("--no_csv", action="store_true",
                         help="Disable CSV trajectory logging")
     args = parser.parse_args()
@@ -990,6 +1021,8 @@ if __name__ == "__main__":
         tracking_cfg["min_hits"] = args.min_hits
     if args.max_assoc_dist is not None:
         tracking_cfg["max_association_dist"] = args.max_assoc_dist
+    if args.coast_velocity_decay is not None:
+        tracking_cfg["coast_velocity_decay"] = args.coast_velocity_decay
     if args.no_csv:
         tracking_cfg["csv_logging"] = False
 
