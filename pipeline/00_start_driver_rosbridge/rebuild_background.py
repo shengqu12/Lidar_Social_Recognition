@@ -496,6 +496,16 @@ def main():
     # Step 6: download (only reached after successful promotion)
     download_model(ip, user, remote_model, local_model)
 
+    # Trigger NAS archive hook for the new model if NAS is configured.
+    # Uses check=False so a NAS connectivity problem never aborts a successful rebuild.
+    if Path.home().joinpath(".nas_password").exists():
+        hook = Path(__file__).parent / "post_record_hook.py"
+        subprocess.run(
+            [sys.executable, str(hook),
+             "--with-model", "--node", args.node],
+            check=False,
+        )
+
     if not args.keep_bag:
         cleanup_bag(ip, user, bag_name)
 

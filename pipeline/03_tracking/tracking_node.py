@@ -51,6 +51,7 @@ from clustering_node import (
     euclidean_clustering,
     cluster_to_bbox,
     is_valid_person_cluster,
+    check_vertical_extent,
     detect,
     RosBridgeClient,
 )
@@ -381,7 +382,7 @@ class ATCLogger:
       - velocity  : speed in mm/s
       - angle1    : movement direction in radians (atan2(vy, vx))
       - angle2    : same as angle1 (body facing unknown from overhead)
-      - behavior  : one of walking/standing/sitting/talking/unknown
+      - behavior  : one of walking/stationary/talking/unknown
     """
 
     def __init__(self, output_dir: Path):
@@ -423,11 +424,10 @@ class ATCLogger:
 
 # Behavior-dependent marker colors: (r, g, b)
 _BEHAVIOR_COLORS = {
-    "walking":  (1.0,  0.55, 0.0),   # orange
-    "standing": (0.2,  0.4,  1.0),   # blue
-    "sitting":  (0.0,  0.85, 0.2),   # green
-    "talking":  (1.0,  0.0,  0.0),   # red
-    "unknown":  (0.65, 0.65, 0.65),  # gray
+    "walking":    (1.0,  0.55, 0.0),   # orange
+    "stationary": (0.2,  0.4,  1.0),   # blue
+    "talking":    (1.0,  0.0,  0.0),   # red
+    "unknown":    (0.65, 0.65, 0.65),  # gray
 }
 
 
@@ -437,14 +437,14 @@ class BehaviorClassifier:
     features.  Pure trajectory/geometry — no neural network, no training data.
 
     States:
-      unknown  — warm-up period; fewer than min_window_frames of history
-      walking  — mean speed over window > walk_speed_threshold (m/s)
-      standing — slow AND cluster z-extent >= standing_height_threshold (m)
-      sitting  — slow AND cluster z-extent < standing_height_threshold (m)
-      talking  — two low-speed tracks within talk_distance_threshold (m)
-                 for >= talk_duration_sec seconds (overrides standing/sitting)
+      unknown    — warm-up period; fewer than min_window_frames of history
+      walking    — mean speed over window > walk_speed_threshold (m/s)
+      stationary — speed <= walk_speed_threshold (replaces sitting/standing;
+                   z-extent is unreliable for far-away sparse point clouds)
+      talking    — two stationary tracks within talk_distance_threshold (m)
+                   for >= talk_duration_sec seconds (overrides stationary)
 
-    Priority: talking > walking > sitting/standing > unknown
+    Priority: talking > walking > stationary > unknown
 
     Hysteresis: a new label must persist for behavior_hold_frames consecutive
     frames before the displayed label switches.
@@ -455,7 +455,6 @@ class BehaviorClassifier:
         self._window      = int(cfg.get("window_frames", 30))
         self._min_win     = int(cfg.get("min_window_frames", 15))
         self._walk_spd    = float(cfg.get("walk_speed_threshold", 0.5))
-        self._stand_h     = float(cfg.get("standing_height_threshold", 1.2))
         self._talk_d      = float(cfg.get("talk_distance_threshold", 1.5))
         self._talk_dur    = float(cfg.get("talk_duration_sec", 30.0))
         self._hold_frames = int(cfg.get("behavior_hold_frames", 5))
@@ -541,19 +540,15 @@ class BehaviorClassifier:
             # Mean speed using incremental path-length cache (O(1) per track)
             mean_speed = self._path_lens[tid] / dt_total
 
-            mean_z_extent = float(np.mean([w["z_extent"] for w in win]))
-
             if mean_speed > self._walk_spd:
                 raw[tid] = "walking"
-            elif mean_z_extent >= self._stand_h:
-                raw[tid] = "standing"
             else:
-                raw[tid] = "sitting"
+                raw[tid] = "stationary"
 
         # Pairwise talking detection — only among confirmed slow tracks
         track_map  = {t["id"]: t for t in tracks}
         slow_ids   = [tid for tid, lbl in raw.items()
-                      if lbl in ("standing", "sitting")]
+                      if lbl == "stationary"]
         active_pairs: set = set()
 
         for i in range(len(slow_ids)):
@@ -621,7 +616,7 @@ class BehaviorClassifier:
         for lbl in behaviors.values():
             counts[lbl] = counts.get(lbl, 0) + 1
         parts = []
-        for lbl in ("walking", "standing", "sitting", "talking", "unknown"):
+        for lbl in ("walking", "stationary", "talking", "unknown"):
             if counts.get(lbl, 0) > 0:
                 parts.append(f"{lbl[:4]}={counts[lbl]}")
         return " ".join(parts)
@@ -672,6 +667,7 @@ class TrackingNode:
         self._frame_buf: deque = deque(maxlen=self.accum_frames)
         self._frame_count = 0
         self._rejected_count = 0
+        self._vert_rejected_buf: list = []  # z-extents of furniture-rejected clusters
 
         # Estimate fps from first few frames
         self._fps_times: deque = deque(maxlen=10)
@@ -755,7 +751,8 @@ class TrackingNode:
 
         merged = np.vstack(list(self._frame_buf))
 
-        # Detect
+        # Detect (vertical rejections are accumulated in _vert_rejected_buf
+        # and logged every 20 frames for furniture threshold tuning)
         detections = detect(
             merged,
             cluster_tol=self.cluster_tol,
@@ -764,6 +761,7 @@ class TrackingNode:
             max_persons=self.max_persons,
             roi_cfg=None,       # already applied above
             filter_cfg=self.filter_cfg,
+            _vert_rejected=self._vert_rejected_buf,
         )
 
         # Remove detections that are persistently at a static location (furniture)
@@ -787,10 +785,17 @@ class TrackingNode:
         if self._frame_count % 20 == 0:
             active = len(tracks)
             bhv_summary = self.behavior_clf.count_summary(behaviors)
+            vert_info = ""
+            if self._vert_rejected_buf:
+                sample = ", ".join(f"{z:.2f}" for z in self._vert_rejected_buf[-5:])
+                vert_info = (f"  | vert_reject={len(self._vert_rejected_buf)} "
+                             f"z=[{sample}]m")
             print(f"[frame {self._frame_count:>4}]  "
                   f"pts={len(merged):>5}  det={len(detections):>2}  "
                   f"tracks={active:>2}  fps={self._fps:.1f}  {dt*1000:.0f}ms"
-                  + (f"  | {bhv_summary}" if bhv_summary else ""))
+                  + (f"  | {bhv_summary}" if bhv_summary else "")
+                  + vert_info)
+            self._vert_rejected_buf.clear()
 
     # ── decode ────────────────────────────────────────────────────────────────
 

@@ -449,6 +449,15 @@ def main() -> None:
             sys.exit(1)
 
     if args.stop:
+        # Trigger NAS archive hook if configured (no-op when ~/.nas_password absent)
+        if Path.home().joinpath(".nas_password").exists():
+            hook = Path(__file__).parent / "post_record_hook.py"
+            subprocess.run(
+                [sys.executable, str(hook),
+                 "--all-pending", "--with-csvs",
+                 "--node", args.node],
+                check=False,
+            )
         return
 
     # Start sequence

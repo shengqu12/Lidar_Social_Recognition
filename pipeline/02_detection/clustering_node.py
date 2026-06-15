@@ -137,6 +137,9 @@ def is_valid_person_cluster(bbox: dict, filter_cfg: dict) -> bool:
     Reject clusters that don't match expected human geometry:
       - Both XY extents must be within [min_xy_size, max_xy_size]
       - XY aspect ratio must be <= max_aspect_ratio  (kills wall lines)
+
+    Note: vertical extent (z) is checked separately in detect() so rejected
+    clusters can be logged with their z-extent for threshold tuning.
     """
     sx, sy = float(bbox["size"][0]), float(bbox["size"][1])
     min_s = float(filter_cfg.get("min_xy_size", 0.15))
@@ -153,6 +156,25 @@ def is_valid_person_cluster(bbox: dict, filter_cfg: dict) -> bool:
     return True
 
 
+def check_vertical_extent(bbox: dict, filter_cfg: dict) -> tuple:
+    """
+    Check whether a cluster's vertical extent (max_z - min_z) falls within the
+    range expected for people (standing or seated).
+
+    A standing/seated person spans roughly 1.0-1.7m vertically; a chair or
+    table spans 0.4-0.9m.  The floor of 0.6m is safe for seated people whose
+    z-extent from overhead LiDAR is typically 0.8-1.3m.  When in doubt, this
+    function returns True (keep the cluster) to avoid losing real people.
+
+    Returns:
+        (is_valid: bool, sz: float)  — sz is the measured vertical extent in m.
+    """
+    sz = float(bbox["size"][2])
+    min_z = float(filter_cfg.get("min_vertical_extent", 0.0))  # 0.0 = no floor filter
+    max_z = float(filter_cfg.get("max_vertical_extent", float("inf")))
+    return (min_z <= sz <= max_z), sz
+
+
 # ─── High-level detect() for use by tracking_node ────────────────────────────
 
 def detect(
@@ -163,15 +185,20 @@ def detect(
     max_persons: int = 10,
     roi_cfg: Optional[dict] = None,
     filter_cfg: Optional[dict] = None,
+    _vert_rejected: Optional[list] = None,
 ) -> List[dict]:
     """
     Full detection pipeline on a point array:
-      ROI filter → Euclidean clustering → bbox → shape filter
+      ROI filter -> Euclidean clustering -> bbox -> XY shape filter
+                -> vertical extent filter -> person detections
 
     Args:
-        pts:          (N, 3) foreground points (may be from multiple frames)
-        roi_cfg:      dict from nodes_config roi section (or None to skip)
-        filter_cfg:   dict from nodes_config cluster_filter section (or None to skip)
+        pts:            (N, 3) foreground points (may be from multiple frames)
+        roi_cfg:        dict from nodes_config roi section (or None to skip)
+        filter_cfg:     dict from nodes_config cluster_filter section (or None)
+        _vert_rejected: optional list; if provided, the z-extent (metres) of
+                        each cluster rejected by the vertical extent filter is
+                        appended here so callers can log it for threshold tuning
 
     Returns:
         list of bbox dicts, at most max_persons entries
@@ -187,8 +214,18 @@ def detect(
     detections = []
     for c in clusters:
         bbox = cluster_to_bbox(c)
-        if filter_cfg and not is_valid_person_cluster(bbox, filter_cfg):
-            continue
+        if filter_cfg:
+            # XY shape check: rejects walls, poles, elongated objects
+            if not is_valid_person_cluster(bbox, filter_cfg):
+                continue
+            # Vertical extent check: rejects furniture (chairs, tables) and
+            # spurious merged-cluster blobs.  Favor keeping real people —
+            # when uncertain, check_vertical_extent returns True.
+            ok_z, sz = check_vertical_extent(bbox, filter_cfg)
+            if not ok_z:
+                if _vert_rejected is not None:
+                    _vert_rejected.append(sz)
+                continue
         detections.append(bbox)
         if len(detections) >= max_persons:
             break
@@ -326,6 +363,7 @@ class ClusteringNode:
         self.frame_count = 0
         self._rejected_count = 0
         self._frame_buf: deque = deque(maxlen=self.accum_frames)
+        self._vert_rejected_buf: list = []  # z-extents of furniture-rejected clusters
 
         print(f"Connecting to rosbridge at {jetson_ip}:{port} ...")
         self.client = RosBridgeClient(host=jetson_ip, port=port)
@@ -383,18 +421,28 @@ class ClusteringNode:
             max_points=self.max_points,
         )
 
+        # _vert_rejected accumulates z-extents of furniture-rejected clusters
+        # for the periodic log line below.
+        _vert_rejected_this_frame: list = []
         detections = []
-        rejected = 0
+        rejected_xy = 0
         for c in clusters:
             bbox = cluster_to_bbox(c)
-            if self.filter_cfg and not is_valid_person_cluster(bbox, self.filter_cfg):
-                rejected += 1
-                continue
+            if self.filter_cfg:
+                if not is_valid_person_cluster(bbox, self.filter_cfg):
+                    rejected_xy += 1
+                    continue
+                ok_z, sz = check_vertical_extent(bbox, self.filter_cfg)
+                if not ok_z:
+                    _vert_rejected_this_frame.append(sz)
+                    continue
             detections.append(bbox)
             if len(detections) >= self.max_persons:
                 break
 
+        rejected = rejected_xy + len(_vert_rejected_this_frame)
         self._rejected_count += rejected
+        self._vert_rejected_buf.extend(_vert_rejected_this_frame)
 
         header = msg.get("header", {})
         self._publish_markers(detections, header)
@@ -403,11 +451,18 @@ class ClusteringNode:
         dt = time.time() - t0
         self.frame_count += 1
         if self.frame_count % 20 == 0:
+            vert_info = ""
+            if self._vert_rejected_buf:
+                sample = ", ".join(f"{z:.2f}" for z in self._vert_rejected_buf[-5:])
+                vert_info = (f"  | vert_reject={len(self._vert_rejected_buf)} "
+                             f"z-extents_m=[{sample}]")
             print(f"[frame {self.frame_count:>4}]  "
                   f"raw={len(pts):>4} merged={len(merged):>5} -> "
                   f"{len(detections):>2} persons "
-                  f"(rejected {self._rejected_count} total) | {dt*1000:.0f}ms")
+                  f"(rejected {self._rejected_count} total) | {dt*1000:.0f}ms"
+                  + vert_info)
             self._rejected_count = 0
+            self._vert_rejected_buf.clear()
 
     # ── decode ────────────────────────────────────────────────────────────────
 

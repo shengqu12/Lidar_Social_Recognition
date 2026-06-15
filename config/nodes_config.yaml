@@ -28,6 +28,8 @@ nodes:
       min_xy_size: 0.10
       max_xy_size: 1.0
       max_aspect_ratio: 4.0
+      min_vertical_extent: 0.6   # metres; below this is furniture/floor noise — reject
+      max_vertical_extent: 2.2   # metres; above this is spurious (merged clusters) — reject
     roi:
       enabled: true
       x_min: 0.3
@@ -55,7 +57,6 @@ nodes:
       window_frames: 30
       min_window_frames: 15
       walk_speed_threshold: 0.5
-      standing_height_threshold: 1.2
       talk_distance_threshold: 1.5
       talk_duration_sec: 30.0
       behavior_hold_frames: 5
