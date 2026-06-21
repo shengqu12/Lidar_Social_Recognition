@@ -27,7 +27,7 @@ from pathlib import Path
 # Import NAS utilities from nas_archive.py in the same directory.
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-from nas_archive import _check_prerequisites, archive_bags, archive_csvs, archive_model
+from nas_archive import _check_prerequisites, archive_bags, archive_csvs, archive_model, sync_all
 
 # Project root is two levels up from pipeline/00_start_driver_rosbridge/
 _PROJECT_ROOT = _HERE.parent.parent
@@ -39,6 +39,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--sync-all", action="store_true",
+                        help="Idempotent full sync: upload all un-archived data; "
+                             "rosbags deleted locally after upload")
     parser.add_argument("--all-pending", action="store_true",
                         help="Archive all rosbag directories to NAS")
     parser.add_argument("--with-csvs", action="store_true",
@@ -49,7 +52,7 @@ def main():
                         help="Node name in nodes_config.yaml (default: node1)")
     args = parser.parse_args()
 
-    if not any([args.all_pending, args.with_csvs, args.with_model]):
+    if not any([args.sync_all, args.all_pending, args.with_csvs, args.with_model]):
         parser.print_help()
         return
 
@@ -61,6 +64,12 @@ def main():
         return
 
     password = _check_prerequisites()
+
+    if args.sync_all:
+        print("[NAS hook] Running full idempotent sync ...")
+        sync_all(password, _PROJECT_ROOT, args.node)
+        print("[NAS hook] Done")
+        return
 
     if args.all_pending:
         bags_dir = _PROJECT_ROOT / "data" / "rosbags"

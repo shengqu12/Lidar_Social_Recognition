@@ -16,6 +16,11 @@ Usage:
 
     # Node 2 (once configured in nodes_config.yaml):
     python3 launcher.py --restart --node node2
+
+    # Dual-LiDAR fused pipeline (one command):
+    python3 launcher.py --start  --node fused [--with-tracking]
+    python3 launcher.py --stop   --node fused [--stop-deps]
+    python3 launcher.py --status --node fused
 """
 
 import argparse
@@ -39,6 +44,21 @@ def load_node_config(config_path: str, node_name: str) -> dict:
         raise ValueError(f"Node '{node_name}' not found in {config_path}. "
                          f"Available: {available}")
     return nodes[node_name]
+
+
+def load_fusion_sources(config_path: str) -> list[str]:
+    """Return ordered list of real node names from fusion.sources."""
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    sources = data.get("fusion", {}).get("sources", [])
+    return [s["node"] for s in sources]
+
+
+def load_fusion_publish_via(config_path: str) -> str:
+    """Return the node name that hosts the rosbridge relay for fused output."""
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    return data.get("fusion", {}).get("publish_via", "node1")
 
 
 # ─── SSH helpers ──────────────────────────────────────────────────────────────
@@ -221,10 +241,11 @@ def start_rosbridge(cfg: dict) -> bool:
 
 def start_lidar_driver(cfg: dict) -> bool:
     print("  [2/3] Starting LiDAR driver (livox_ros_driver2)...")
+    launch_file = cfg.get("lidar_launch_file", "msg_MID360_launch.py")
     cmd = (
         "source /opt/ros/humble/setup.bash && "
         "source ~/ros2_ws/install/setup.bash && "
-        "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
+        f"ros2 launch livox_ros_driver2 {launch_file}"
     )
     ssh_run(cfg, cmd, background=True, log_file="/tmp/lidar_driver.log")
 
@@ -309,6 +330,18 @@ def start_bg_removal(cfg: dict) -> bool:
     print(f"  [3/3] WARNING: {topic} not visible after 15 s")
     print(f"         Check: ssh {cfg['jetson_user']}@{cfg['jetson_ip']} "
           f"'tail -f /tmp/bg_removal.log'")
+    return True
+
+
+def start_real_node(node_name: str, config_path: str) -> bool:
+    """Stop then bring up all services for a real (Jetson-backed) node."""
+    cfg = load_node_config(config_path, node_name)
+    if not stop_all(cfg):
+        return False
+    if not start_rosbridge(cfg):
+        return False
+    start_lidar_driver(cfg)
+    start_bg_removal(cfg)
     return True
 
 
@@ -399,6 +432,190 @@ def launch_tracking_local(cfg: dict, config_path: str, node_name: str) -> None:
     os.execv(sys.executable, cmd)
 
 
+# ─── Fused (virtual) node helpers ────────────────────────────────────────────
+
+_OVERLAY_PID_FILE = Path("/tmp/overlay_node.pid")
+_OVERLAY_LOG_FILE = Path("/tmp/overlay_node.log")
+
+
+def _is_node_healthy(cfg: dict) -> bool:
+    """True when the Jetson's rosbridge port is open and bg removal is running."""
+    port = cfg["rosbridge_port"]
+    return (ssh_check(cfg, f"ss -tlnp | grep -q :{port}")
+            and _count_procs(cfg, "statistical_bg_node.py") > 0)
+
+
+def _overlay_pid() -> int | None:
+    """Return the running overlay_node PID from the pid file, or None if not alive."""
+    try:
+        pid = int(_OVERLAY_PID_FILE.read_text().strip())
+        Path(f"/proc/{pid}").stat()   # raises OSError if process is gone
+        return pid
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _kill_overlay() -> None:
+    """SIGTERM then SIGKILL the local overlay_node process."""
+    pid = _overlay_pid()
+    if pid is None:
+        return
+    print(f"  Stopping overlay_node (PID {pid})...")
+    try:
+        os.kill(pid, 15)  # SIGTERM
+        time.sleep(1)
+        try:
+            os.kill(pid, 0)   # still alive?
+            os.kill(pid, 9)   # SIGKILL
+            print("  overlay_node required SIGKILL.")
+        except ProcessLookupError:
+            pass
+    except ProcessLookupError:
+        pass
+    _OVERLAY_PID_FILE.unlink(missing_ok=True)
+    print("  overlay_node stopped.")
+
+
+def start_fused_stack(cfg: dict, config_path: str) -> bool:
+    """
+    Bring up the dual-LiDAR fusion stack:
+      1. For each real dependency: skip if healthy, otherwise stop+start it.
+      2. Kill any existing overlay_node; start a fresh one locally.
+      3. Wait up to 15 s for cfg['foreground_topic'] to appear via the relay node.
+    Returns True on success.
+    """
+    dep_names = load_fusion_sources(config_path)
+    publish_via = load_fusion_publish_via(config_path)
+
+    print()
+    print("=" * 58)
+    print("LiDAR Social Recognition Pipeline — Fused Stack")
+    print("=" * 58)
+    print(f"Dependencies: {', '.join(dep_names)}")
+    print(f"Fused output: {cfg['foreground_topic']} via {publish_via}")
+    print()
+
+    # ── Step 1: ensure each real dependency node is up ────────────────────────
+    for dep_name in dep_names:
+        dep_cfg = load_node_config(config_path, dep_name)
+        print(f"[{dep_name}] Checking health ({dep_cfg['jetson_user']}@{dep_cfg['jetson_ip']})...")
+        if _is_node_healthy(dep_cfg):
+            print(f"[{dep_name}] Already healthy — skipping restart.\n")
+        else:
+            print(f"[{dep_name}] Not healthy — starting now.")
+            if not start_real_node(dep_name, config_path):
+                print(f"[{dep_name}] Failed to start — aborting fused stack.")
+                return False
+            print(f"[{dep_name}] Started.\n")
+
+    # ── Step 2: (re)start overlay_node.py locally ─────────────────────────────
+    overlay_script = Path(__file__).parent.parent / "06_fusion" / "overlay_node.py"
+    if not overlay_script.exists():
+        print(f"  ERROR: overlay_node.py not found at {overlay_script}")
+        return False
+
+    _kill_overlay()   # no-op if not running
+
+    print(f"  Starting overlay_node.py (log → {_OVERLAY_LOG_FILE})...")
+    log_fh = open(_OVERLAY_LOG_FILE, "w")
+    proc = subprocess.Popen(
+        [sys.executable, str(overlay_script), "--config", config_path],
+        stdout=log_fh,
+        stderr=log_fh,
+        start_new_session=True,
+    )
+    log_fh.close()   # parent closes its copy; subprocess retains the fd
+    _OVERLAY_PID_FILE.write_text(str(proc.pid))
+    print(f"  overlay_node PID {proc.pid} — pid file: {_OVERLAY_PID_FILE}")
+
+    # ── Step 3: wait for /fused/foreground to appear ──────────────────────────
+    relay_cfg = load_node_config(config_path, publish_via)
+    fused_topic = cfg["foreground_topic"]
+    check_cmd = (
+        "source /opt/ros/humble/setup.bash && "
+        "source ~/ros2_ws/install/setup.bash && "
+        f"ros2 topic list 2>/dev/null | grep -q '{fused_topic}'"
+    )
+    print(f"  Waiting for {fused_topic} on {publish_via} (up to 15 s)...")
+    for _ in range(15):
+        time.sleep(1)
+        if proc.poll() is not None:
+            print(f"  ERROR: overlay_node exited unexpectedly (rc={proc.returncode}).")
+            print(f"         Check: tail {_OVERLAY_LOG_FILE}")
+            return False
+        if ssh_check(relay_cfg, check_cmd):
+            print(f"  {fused_topic} visible — fusion stack ready.")
+            break
+    else:
+        print(f"  ERROR: {fused_topic} did not appear within 15 s.")
+        print(f"         overlay_node still running (PID {proc.pid}) — left alive for diagnosis.")
+        print(f"         Check: tail {_OVERLAY_LOG_FILE}")
+        return False
+
+    print()
+    print("=" * 58)
+    print("Fused stack started successfully.")
+    print(f"  Foxglove:  ws://{relay_cfg['jetson_ip']}:{relay_cfg['rosbridge_port']}")
+    print(f"  Topic:     {fused_topic}")
+    print(f"  overlay log:  tail -f {_OVERLAY_LOG_FILE}")
+    print("=" * 58)
+    return True
+
+
+def stop_fused_stack(config_path: str, stop_deps: bool = False) -> bool:
+    """
+    Kill the local overlay_node process.
+    With stop_deps=True, also stops the real dependency nodes (node1, node3).
+    """
+    _kill_overlay()
+
+    if not stop_deps:
+        return True
+
+    all_ok = True
+    dep_names = load_fusion_sources(config_path)
+    for dep_name in dep_names:
+        dep_cfg = load_node_config(config_path, dep_name)
+        print(f"\n[{dep_name}] Stopping...")
+        ok = stop_all(dep_cfg)
+        if not ok:
+            all_ok = False
+    return all_ok
+
+
+def status_fused(cfg: dict, config_path: str) -> None:
+    """Report status of each dependency node, overlay_node, and the fused topic."""
+    dep_names = load_fusion_sources(config_path)
+    publish_via = load_fusion_publish_via(config_path)
+
+    for dep_name in dep_names:
+        dep_cfg = load_node_config(config_path, dep_name)
+        print(f"── {dep_name} ──")
+        check_status(dep_cfg)
+
+    print("── overlay_node (local) ──")
+    pid = _overlay_pid()
+    if pid is not None:
+        print(f"  overlay_node:  PID {pid}  OK")
+    else:
+        print("  overlay_node:  not running")
+    print(f"  Log:  tail -f {_OVERLAY_LOG_FILE}")
+    print()
+
+    relay_cfg = load_node_config(config_path, publish_via)
+    fused_topic = cfg["foreground_topic"]
+    check_cmd = (
+        "source /opt/ros/humble/setup.bash && "
+        "source ~/ros2_ws/install/setup.bash && "
+        f"ros2 topic list 2>/dev/null | grep -q '{fused_topic}'"
+    )
+    topic_live = ssh_check(relay_cfg, check_cmd)
+    print("── fused output ──")
+    print(f"  {fused_topic:<44} {'publishing' if topic_live else 'NOT FOUND'}")
+    print(f"  Foxglove:  ws://{relay_cfg['jetson_ip']}:{relay_cfg['rosbridge_port']}")
+    print()
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -417,18 +634,30 @@ def main() -> None:
                         help="Stop then start (equivalent to --stop + --start)")
     parser.add_argument("--status",  action="store_true",
                         help="Check status of all services")
+    parser.add_argument("--sync-nas", action="store_true",
+                        help="Push all un-archived local data to NAS (rosbags freed after upload)")
     parser.add_argument("--with-clustering", action="store_true",
                         help="After --start/--restart, also launch clustering node locally")
     parser.add_argument("--with-tracking", action="store_true",
                         help="After --start/--restart, launch tracking node (detection + tracking + CSV)")
+    parser.add_argument("--stop-deps", action="store_true",
+                        help="With --stop --node fused: also stop the real dep nodes (node1, node3)")
     parser.add_argument("--node",   default="node1",
                         help="Node name in nodes_config.yaml (default: node1)")
     parser.add_argument("--config", default=default_config,
                         help=f"Path to nodes_config.yaml (default: {default_config})")
     args = parser.parse_args()
 
-    if not any([args.start, args.stop, args.restart, args.status]):
+    if not any([args.start, args.stop, args.restart, args.status, args.sync_nas]):
         parser.print_help()
+        return
+
+    if args.sync_nas:
+        hook = Path(__file__).parent / "post_record_hook.py"
+        subprocess.run(
+            [sys.executable, str(hook), "--sync-all", "--node", args.node],
+            check=False,
+        )
         return
 
     try:
@@ -436,6 +665,36 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as e:
         print(f"Config error: {e}")
         sys.exit(1)
+
+    # ── Virtual (fused) node dispatch ─────────────────────────────────────────
+    if cfg.get("virtual", False):
+        if args.status:
+            status_fused(cfg, args.config)
+            return
+
+        if args.stop or args.restart:
+            ok = stop_fused_stack(args.config, stop_deps=args.stop_deps)
+            if not ok:
+                print("Stop sequence had errors — check output above.")
+                sys.exit(1)
+            if args.stop and not args.restart:
+                return
+
+        # --start or --restart: bring up the full fusion stack
+        ok = start_fused_stack(cfg, args.config)
+        if not ok:
+            print("\nFused stack failed to start — aborting.")
+            sys.exit(1)
+
+        if args.with_tracking:
+            time.sleep(2)
+            launch_tracking_local(cfg, args.config, args.node)
+        elif args.with_clustering:
+            time.sleep(2)
+            launch_clustering_local(cfg, args.config, args.node)
+        return
+
+    # ── Real (Jetson-backed) node path — unchanged ────────────────────────────
 
     if args.status:
         check_status(cfg)
@@ -449,13 +708,11 @@ def main() -> None:
             sys.exit(1)
 
     if args.stop:
-        # Trigger NAS archive hook if configured (no-op when ~/.nas_password absent)
+        # Trigger NAS full sync if configured (no-op when ~/.nas_password absent)
         if Path.home().joinpath(".nas_password").exists():
             hook = Path(__file__).parent / "post_record_hook.py"
             subprocess.run(
-                [sys.executable, str(hook),
-                 "--all-pending", "--with-csvs",
-                 "--node", args.node],
+                [sys.executable, str(hook), "--sync-all", "--node", args.node],
                 check=False,
             )
         return

@@ -25,6 +25,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # ─── NAS connection constants ──────────────────────────────────────────────────
@@ -177,6 +178,150 @@ def archive_model(password: str, model_path: Path, node: str) -> None:
         print(f"  ERROR: rsync failed for {model_path.name} (exit {rc})")
     else:
         print(f"  OK: {model_path.name}")
+
+
+# ─── Full idempotent sync ─────────────────────────────────────────────────────
+
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+@dataclass
+class _SyncStats:
+    local: int = 0
+    already_on_nas: int = 0
+    uploaded: int = 0
+    failed: int = 0
+    bytes_freed: int = 0
+
+
+def sync_all(password: str, project_root: Path, node: str) -> None:
+    """
+    Idempotent catch-all sync — uploads every local item not yet on NAS.
+    Rosbags: purge local after verified upload (they're big).
+    CSVs and models: copy only, keep local (tiny).
+    NAS safety rule: one `test` call per item, never ls/find/du on NAS dirs.
+    """
+    all_stats: dict[str, _SyncStats] = {}
+
+    # ── rosbags ───────────────────────────────────────────────────────────────
+    bags_stats = _SyncStats()
+    bags_dir = project_root / "data" / "rosbags"
+    remote_bags = f"{NAS_ARCHIVE_ROOT}/{node}/bags/"
+
+    if bags_dir.exists():
+        bag_dirs = [p for p in sorted(bags_dir.iterdir())
+                    if p.is_dir() and not p.name.startswith(".")]
+        bags_stats.local = len(bag_dirs)
+        if bag_dirs:
+            _ensure_remote_dir(password, remote_bags)
+        for bag in bag_dirs:
+            chk = _ssh_run(password, f"test -d {remote_bags}{bag.name}")
+            if chk.returncode == 0:
+                bags_stats.already_on_nas += 1
+                continue
+            bag_size = sum(f.stat().st_size for f in bag.rglob("*") if f.is_file())
+            print(f"  [bag] uploading {bag.name} ...")
+            rc = _rsync_push(password, str(bag), remote_bags)
+            if rc != 0:
+                bags_stats.failed += 1
+                print(f"  ERROR: rsync failed for bag {bag.name} (exit {rc})")
+            else:
+                bags_stats.uploaded += 1
+                bags_stats.bytes_freed += bag_size
+                shutil.rmtree(bag)
+                print(f"  OK (freed {_human_bytes(bag_size)}): {bag.name}")
+
+    all_stats["rosbags"] = bags_stats
+
+    # ── tracklet CSVs ─────────────────────────────────────────────────────────
+    tracklets_stats = _SyncStats()
+    tracklets_dir = project_root / "data" / "tracklets"
+    remote_csvs = f"{NAS_ARCHIVE_ROOT}/{node}/csvs/"
+
+    if tracklets_dir.exists():
+        csvs = sorted(tracklets_dir.glob("session_*.csv"))
+        tracklets_stats.local = len(csvs)
+        if csvs:
+            _ensure_remote_dir(password, remote_csvs)
+        for csv in csvs:
+            chk = _ssh_run(password, f"test -f {remote_csvs}{csv.name}")
+            if chk.returncode == 0:
+                tracklets_stats.already_on_nas += 1
+                continue
+            rc = _rsync_push(password, str(csv), remote_csvs)
+            if rc != 0:
+                tracklets_stats.failed += 1
+                print(f"  ERROR: rsync failed for {csv.name}")
+            else:
+                tracklets_stats.uploaded += 1
+                print(f"  OK: {csv.name}")
+
+    all_stats["tracklets"] = tracklets_stats
+
+    # ── encounters CSVs ───────────────────────────────────────────────────────
+    encounters_stats = _SyncStats()
+    encounters_dir = project_root / "data" / "encounters"
+    remote_encounters = f"{NAS_ARCHIVE_ROOT}/{node}/encounters/"
+
+    if encounters_dir.exists():
+        enc_csvs = sorted(encounters_dir.glob("*.csv"))
+        encounters_stats.local = len(enc_csvs)
+        if enc_csvs:
+            _ensure_remote_dir(password, remote_encounters)
+        for csv in enc_csvs:
+            # Encounters files grow over time — always rsync (fast delta, small file)
+            rc = _rsync_push(password, str(csv), remote_encounters)
+            if rc != 0:
+                encounters_stats.failed += 1
+                print(f"  ERROR: rsync failed for {csv.name}")
+            else:
+                encounters_stats.uploaded += 1
+
+    all_stats["encounters"] = encounters_stats
+
+    # ── background models ─────────────────────────────────────────────────────
+    models_stats = _SyncStats()
+    models_dir = project_root / "models"
+    remote_models = f"{NAS_ARCHIVE_ROOT}/{node}/models/"
+
+    if models_dir.exists():
+        model_files = sorted(models_dir.glob("background_statistical*.npz"))
+        models_stats.local = len(model_files)
+        if model_files:
+            _ensure_remote_dir(password, remote_models)
+        for model in model_files:
+            chk = _ssh_run(password, f"test -f {remote_models}{model.name}")
+            if chk.returncode == 0:
+                models_stats.already_on_nas += 1
+                continue
+            rc = _rsync_push(password, str(model), remote_models)
+            if rc != 0:
+                models_stats.failed += 1
+                print(f"  ERROR: rsync failed for {model.name}")
+            else:
+                models_stats.uploaded += 1
+                print(f"  OK: {model.name}")
+
+    all_stats["models"] = models_stats
+
+    # ── summary table ─────────────────────────────────────────────────────────
+    total_freed = sum(s.bytes_freed for s in all_stats.values())
+    print()
+    print("  ┌──────────────┬───────┬──────────┬──────────┬────────┬────────────┐")
+    print("  │ Kind         │ Local │ On NAS   │ Uploaded │ Failed │ Freed      │")
+    print("  ├──────────────┼───────┼──────────┼──────────┼────────┼────────────┤")
+    for kind, s in all_stats.items():
+        freed = _human_bytes(s.bytes_freed) if s.bytes_freed else "—"
+        print(f"  │ {kind:<12} │ {s.local:>5} │ {s.already_on_nas:>8} │"
+              f" {s.uploaded:>8} │ {s.failed:>6} │ {freed:>10} │")
+    print("  └──────────────┴───────┴──────────┴──────────┴────────┴────────────┘")
+    if total_freed:
+        print(f"  Total freed: {_human_bytes(total_freed)}")
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────

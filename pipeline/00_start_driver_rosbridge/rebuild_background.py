@@ -42,11 +42,12 @@ Algorithm reference:
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
+import threading
 import time
-import os
 from pathlib import Path
 import yaml
 
@@ -93,7 +94,7 @@ def ssh_ok(ip: str, user: str, cmd: str) -> bool:
 
 # ─── Steps ────────────────────────────────────────────────────────────────────
 
-def check_disk_space(ip: str, user: str):
+def check_disk_space(ip: str, user: str, interactive: bool = True):
     print("Checking Jetson disk space...")
     result = ssh_run(ip, user, "df -h / | tail -1")
     line = result.stdout.strip()
@@ -105,10 +106,13 @@ def check_disk_space(ip: str, user: str):
         if avail.endswith('M') or (avail.endswith('G') and float(avail[:-1]) < 2.0):
             print(f"  WARNING: Only {avail} available on Jetson.")
             print("  Consider cleaning up before recording.")
-            answer = input("  Continue anyway? [y/N] ").strip().lower()
-            if answer != 'y':
-                print("Aborted.")
-                sys.exit(0)
+            if not interactive:
+                print("  (Non-interactive: proceeding despite low disk space.)")
+            else:
+                answer = input("  Continue anyway? [y/N] ").strip().lower()
+                if answer != 'y':
+                    print("Aborted.")
+                    sys.exit(0)
     print("  Disk space OK.")
 
 
@@ -145,7 +149,8 @@ def check_lidar_publishing(ip: str, user: str, topic: str,
 
 
 def record_empty_scene(ip: str, user: str, topic: str,
-                       duration: int, bag_name: str = "empty_scene_rebuild"):
+                       duration: int, bag_name: str = "empty_scene_rebuild",
+                       abort=None):
     print(f"\nRecording empty scene for {duration} seconds...")
     print(f"  IMPORTANT: Make sure the room is EMPTY (no people in LiDAR view)")
     print(f"  Recording to: ~/{bag_name}/")
@@ -174,6 +179,10 @@ def record_empty_scene(ip: str, user: str, topic: str,
     # Real-time countdown printed to console
     print(f"  Progress: ", end="", flush=True)
     for elapsed in range(duration):
+        # Check abort each second so a peer failure stops this countdown promptly.
+        if abort is not None and abort.is_set():
+            print("\n  Abort signal received — exiting record countdown.")
+            sys.exit(1)
         time.sleep(1)
         if (elapsed + 1) % 10 == 0:
             remaining = duration - elapsed - 1
@@ -233,7 +242,7 @@ def validate_bag_size(ip: str, user: str, db3_path: str,
 
 def build_model_on_jetson(ip: str, user: str, db3_path: str,
                           output_path: str, voxel_size: float,
-                          max_frames: int) -> tuple:
+                          max_frames: int, abort=None) -> tuple:
     """
     Build the model to a temp file on the Jetson, streaming output live.
 
@@ -283,6 +292,12 @@ def build_model_on_jetson(ip: str, user: str, db3_path: str,
     )
     captured_lines = []
     for line in proc.stdout:
+        # Check abort each output line; kill the SSH process so proc.wait()
+        # returns non-zero and the existing cleanup block (rm -f temp) fires.
+        if abort is not None and abort.is_set():
+            print("\n  Abort signal received — killing model build.")
+            proc.kill()
+            break   # fall through to proc.wait(); non-zero rc triggers cleanup
         print(line, end="")
         sys.stdout.flush()
         captured_lines.append(line)
@@ -362,14 +377,20 @@ def download_model(ip: str, user: str,
     print(f"\nDownloading model to {local_path}...")
     Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # scp to a sibling .part file; atomic rename on success so a mid-transfer
+    # kill never overwrites the previous good model with a truncated file.
+    part_path = local_path + ".part"
     result = subprocess.run([
         "scp",
         f"{user}@{ip}:{remote_path}",
-        local_path
+        part_path
     ])
     if result.returncode != 0:
+        if os.path.exists(part_path):
+            os.remove(part_path)
         print("  ERROR: Download failed.")
         sys.exit(1)
+    os.replace(part_path, local_path)   # atomic same-directory rename
     size = os.path.getsize(local_path)
     print(f"  Downloaded ({size/1024:.0f} KB)")
 
@@ -398,10 +419,279 @@ def print_next_steps(local_model_path: str, config_path: str, node_name: str):
     print(f"  Target: avg_fg < 50 in empty scene")
 
 
+# ─── Fused-node helpers ───────────────────────────────────────────────────────
+
+def load_fusion_sources(config_path: str) -> list:
+    """Return ordered list of physical node names from fusion.sources in config."""
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    sources = data.get('fusion', {}).get('sources', [])
+    return [s['node'] for s in sources]
+
+
+def cleanup_failed_node(node_name: str, args, config_path: str) -> None:
+    """Best-effort cleanup of Jetson + local artifacts after a failed or aborted rebuild.
+
+    NEVER removes the final good model (background_statistical_nodeX.npz on the
+    Jetson or models/background_statistical_nodeX.npz locally).
+    Each step is individually try/except so one failure does not skip the rest.
+    """
+    node = load_node_config(config_path, node_name)
+    ip   = node['jetson_ip']
+    user = node['jetson_user']
+    bag_name = (args.bag_name if args.bag_name is not None
+                else node.get('rebuild_background', {}).get('bag_name', 'empty_scene_rebuild'))
+    remote_model = node.get('bg_model_path', f"~/background_statistical_{node_name}.npz")
+    # Only the _new.npz temp file — NEVER the final good model.
+    temp_model = (remote_model[:-4] + '_new.npz' if remote_model.endswith('.npz')
+                  else remote_model + '_new.npz')
+
+    project_root = Path(__file__).parent.parent.parent
+    # .part is left by an interrupted download_model scp.
+    local_part = str(project_root / "models" /
+                     f"background_statistical_{node_name}.npz") + ".part"
+
+    print(f"\n[{node_name}] Running failure cleanup...")
+
+    # 1. Stop any decoupled Jetson recording (launched with nohup, runs independently).
+    try:
+        ssh_run(ip, user, "pkill -9 -f 'ros2 bag record' 2>/dev/null; true")
+        print(f"  [{node_name}] pkill ros2 bag record — done")
+    except Exception as exc:
+        print(f"  [{node_name}] pkill failed: {exc}")
+
+    # 2. Remove bag dir from Jetson.
+    try:
+        ssh_run(ip, user, f"rm -rf ~/{bag_name}")
+        print(f"  [{node_name}] rm -rf ~/{bag_name} — done")
+    except Exception as exc:
+        print(f"  [{node_name}] bag removal failed: {exc}")
+
+    # 3. Remove temp model from Jetson (_new.npz only — NOT the final good model).
+    try:
+        ssh_run(ip, user, f"rm -f {temp_model}")
+        print(f"  [{node_name}] rm -f {temp_model} — done")
+    except Exception as exc:
+        print(f"  [{node_name}] temp model removal failed: {exc}")
+
+    # 4. Remove local .part file if a partial scp download was interrupted.
+    try:
+        if os.path.exists(local_part):
+            os.remove(local_part)
+            print(f"  [{node_name}] removed local {local_part}")
+    except Exception as exc:
+        print(f"  [{node_name}] local .part removal failed: {exc}")
+
+
+# ─── Single-node rebuild ──────────────────────────────────────────────────────
+
+def run_single_node(node_name: str, args, config_path: str,
+                    interactive: bool = True,
+                    nas_lock=None,
+                    abort=None) -> bool:
+    """Run the full 10-step rebuild for one physical node. Returns True on success.
+
+    interactive=False  skips all input() prompts (parallel worker mode;
+                       run_fused hoists them before spawning threads).
+    nas_lock           threading.Lock passed by run_fused to serialise NAS
+                       rsync pushes; None on the single-node path (no locking).
+    abort              threading.Event checked at step boundaries and inside the
+                       recording countdown and model-build loops so a peer's
+                       failure stops this node within ~1 s of being set.
+
+    sys.exit(0) from interactive prompts is re-raised (user abort → stop all).
+    sys.exit(1) from step failures is caught and converted to False so the
+    caller (run_fused worker) can run per-node cleanup.
+    """
+    project_root = Path(__file__).parent.parent.parent
+    try:
+        node = load_node_config(config_path, node_name)
+        ip   = node['jetson_ip']
+        user = node['jetson_user']
+        topic = node.get('lidar_topic', '/livox/lidar')
+
+        # Resolution order: CLI arg (if explicitly passed) > config value > hardcoded default
+        rb_cfg     = node.get('rebuild_background', {})
+        duration   = args.duration   if args.duration   is not None else rb_cfg.get('duration',  60)
+        voxel_size = args.voxel_size if args.voxel_size is not None else rb_cfg.get('voxel_size', 0.15)
+        max_frames = args.max_frames if args.max_frames is not None else rb_cfg.get('max_frames', 300)
+        bag_name   = args.bag_name   if args.bag_name   is not None else rb_cfg.get('bag_name',  'empty_scene_rebuild')
+
+        if duration < 30:
+            print("ERROR: --duration must be at least 30 seconds.")
+            sys.exit(1)
+
+        # Determine output paths — bg_model_path in config is the remote (Jetson) path
+        remote_model = node.get('bg_model_path', f"~/background_statistical_{node_name}.npz")
+        if args.output:
+            local_model = args.output
+        else:
+            local_model = str(project_root / "models" /
+                             f"background_statistical_{node_name}.npz")
+
+        print("=" * 60)
+        print(f"Background Model Reconstruction — {node_name}")
+        print("=" * 60)
+        print(f"  Jetson:      {user}@{ip}")
+        print(f"  Topic:       {topic}")
+        print(f"  Duration:    {duration}s")
+        print(f"  Voxel size:  {voxel_size}m")
+        print(f"  Output:      {local_model}")
+        if args.force:
+            print(f"  --force:     pre-recording LiDAR check will be skipped")
+        print()
+
+        # Room-empty confirmation — skipped in parallel mode; run_fused hoists it.
+        if interactive:
+            print("IMPORTANT: The room must be completely empty during recording.")
+            answer = input("Is the room empty? [y/N] ").strip().lower()
+            if answer != 'y':
+                print("Please clear the room first, then re-run.")
+                sys.exit(0)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 1: pre-flight checks
+        check_disk_space(ip, user, interactive=interactive)
+        check_lidar_publishing(ip, user, topic, node_name=node_name, force=args.force)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 2: record (countdown loop checks abort each second)
+        db3_path, bag_name = record_empty_scene(
+            ip, user, topic, duration, bag_name, abort=abort)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 3: validate bag before touching the existing model
+        validate_bag_size(ip, user, db3_path, node_name, topic)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 4: build to temp file (stdout loop checks abort each line)
+        temp_path, build_output = build_model_on_jetson(
+            ip, user, db3_path, remote_model,
+            voxel_size, max_frames, abort=abort)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 5: validate voxel count, then atomically rename temp → final
+        validate_and_promote_model(ip, user, temp_path, remote_model, build_output)
+
+        if abort is not None and abort.is_set():
+            sys.exit(1)
+
+        # Step 6: download (only reached after successful promotion)
+        download_model(ip, user, remote_model, local_model)
+
+        # Trigger NAS archive hook for the new model if NAS is configured.
+        # Uses check=False so a NAS connectivity problem never aborts a successful rebuild.
+        # Serialised behind nas_lock when running in parallel to protect the Synology.
+        if Path.home().joinpath(".nas_password").exists():
+            hook = Path(__file__).parent / "post_record_hook.py"
+            if nas_lock is not None:
+                nas_lock.acquire()
+            try:
+                subprocess.run(
+                    [sys.executable, str(hook),
+                     "--with-model", "--node", node_name],
+                    check=False,
+                )
+            finally:
+                if nas_lock is not None:
+                    nas_lock.release()
+
+        if not args.keep_bag:
+            cleanup_bag(ip, user, bag_name)
+
+        print_next_steps(local_model, config_path, node_name)
+        return True
+
+    except SystemExit as e:
+        if e.code == 0:
+            raise   # user-initiated abort (room not empty, disk-space prompt) — propagate
+        return False
+
+
+def run_fused(args, config_path: str):
+    """Rebuild background for every physical node in fusion.sources, in parallel.
+
+    Interactive prompts are hoisted here before threads start so workers run
+    non-interactively.  The first failing worker sets abort; all workers check
+    it cooperatively at step boundaries and inside long loops.  NAS rsync
+    pushes are serialised via nas_lock; recording + model build run fully in
+    parallel.
+    """
+    if args.output:
+        print("ERROR: --output is ambiguous when rebuilding multiple nodes (--node fused).")
+        print("       Remove --output; each node uses its own bg_model_path from config.")
+        sys.exit(2)
+
+    node_names = load_fusion_sources(config_path)
+
+    # (a) Hoist interactive prompts before spawning threads — one prompt for all nodes.
+    print("IMPORTANT: ALL LiDAR-covered areas must be completely empty during recording.")
+    answer = input("Is the room empty? [y/N] ").strip().lower()
+    if answer != 'y':
+        print("Please clear the room first, then re-run.")
+        sys.exit(0)
+
+    # (b) Concurrency primitives.
+    abort        = threading.Event()   # set by first failing worker; peers check it
+    nas_lock     = threading.Lock()    # serialises NAS rsync — NOT the build
+    results      = {}                  # node_name -> bool, written by workers
+    results_lock = threading.Lock()    # guards results dict
+
+    def worker(node_name):
+        ok = run_single_node(
+            node_name, args, config_path,
+            interactive=False,
+            nas_lock=nas_lock,
+            abort=abort,
+        )
+        if not ok:
+            # Signal all other workers to stop at their next abort checkpoint.
+            if not abort.is_set():
+                print(f"\n[{node_name}] Failed — signalling abort to peer nodes.")
+            abort.set()
+            # (e) Per-node failure cleanup — bag, temp model, local .part.
+            cleanup_failed_node(node_name, args, config_path)
+        with results_lock:
+            results[node_name] = ok
+
+    # Spawn one thread per physical node and wait for all to finish.
+    threads = [
+        threading.Thread(target=worker, args=(n,), daemon=True, name=n)
+        for n in node_names
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # (f) Summary + exit.
+    print()
+    print("=" * 60)
+    print("Fused rebuild summary:")
+    print("=" * 60)
+    all_ok = True
+    for node_name in node_names:
+        ok = results.get(node_name, False)
+        print(f"  {node_name}  {'✓' if ok else '✗'}")
+        if not ok:
+            all_ok = False
+
+    sys.exit(0 if all_ok else 1)
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    # Find project root relative to this script
     script_dir = Path(__file__).parent
     project_root = script_dir.parent.parent
     default_config = str(project_root / "config" / "nodes_config.yaml")
@@ -415,19 +705,20 @@ def main():
                         help='Node name from nodes_config.yaml (default: node1)')
     parser.add_argument('--config', type=str, default=default_config,
                         help='Path to nodes_config.yaml')
-    parser.add_argument('--duration', type=int, default=60,
-                        help='Recording duration in seconds (default: 60). '
+    parser.add_argument('--duration', type=int, default=None,
+                        help='Recording duration in seconds (default: from config, 60). '
                              'More = better model. 30s minimum.')
-    parser.add_argument('--voxel_size', type=float, default=0.15,
+    parser.add_argument('--voxel_size', type=float, default=None,
                         help='Voxel size for background model in meters '
-                             '(default: 0.15). Larger = more robust to noise.')
-    parser.add_argument('--max_frames', type=int, default=300,
-                        help='Max frames to use for model building (default: 300)')
+                             '(default: from config, 0.15). Larger = more robust to noise.')
+    parser.add_argument('--max_frames', type=int, default=None,
+                        help='Max frames to use for model building (default: from config, 300)')
     parser.add_argument('--output', type=str, default=None,
                         help='Local output path for the model '
                              '(default: models/background_statistical_<node>.npz)')
-    parser.add_argument('--bag_name', type=str, default='empty_scene_rebuild',
-                        help='Name for the temporary rosbag on Jetson')
+    parser.add_argument('--bag_name', type=str, default=None,
+                        help='Name for the temporary rosbag on Jetson '
+                             '(default: from config, empty_scene_rebuild)')
     parser.add_argument('--keep_bag', action='store_true',
                         help='Do not delete the rosbag after building '
                              '(warning: uses disk space on Jetson)')
@@ -437,79 +728,15 @@ def main():
                              'count checks still run unconditionally.')
     args = parser.parse_args()
 
-    if args.duration < 30:
-        print("ERROR: --duration must be at least 30 seconds.")
-        sys.exit(1)
+    # Early virtual-node check — before any jetson_user access.
+    node_dict = load_node_config(args.config, args.node)
+    if node_dict.get('virtual', False):
+        run_fused(args, args.config)
+        return  # run_fused calls sys.exit
 
-    # Load node config
-    node = load_node_config(args.config, args.node)
-    ip = node['jetson_ip']
-    user = node['jetson_user']
-    topic = node.get('lidar_topic', '/livox/lidar')
-
-    # Determine output paths — bg_model_path in config is the remote (Jetson) path
-    remote_model = node.get('bg_model_path', f"~/background_statistical_{args.node}.npz")
-    if args.output:
-        local_model = args.output
-    else:
-        local_model = str(project_root / "models" /
-                         f"background_statistical_{args.node}.npz")
-
-    print("=" * 60)
-    print(f"Background Model Reconstruction — {args.node}")
-    print("=" * 60)
-    print(f"  Jetson:      {user}@{ip}")
-    print(f"  Topic:       {topic}")
-    print(f"  Duration:    {args.duration}s")
-    print(f"  Voxel size:  {args.voxel_size}m")
-    print(f"  Output:      {local_model}")
-    if args.force:
-        print(f"  --force:     pre-recording LiDAR check will be skipped")
-    print()
-
-    # Confirm room is empty
-    print("IMPORTANT: The room must be completely empty during recording.")
-    answer = input("Is the room empty? [y/N] ").strip().lower()
-    if answer != 'y':
-        print("Please clear the room first, then re-run.")
-        sys.exit(0)
-
-    # Step 1: pre-flight checks
-    check_disk_space(ip, user)
-    check_lidar_publishing(ip, user, topic, node_name=args.node, force=args.force)
-
-    # Step 2: record
-    db3_path, bag_name = record_empty_scene(
-        ip, user, topic, args.duration, args.bag_name)
-
-    # Step 3: validate bag before touching the existing model
-    validate_bag_size(ip, user, db3_path, args.node, topic)
-
-    # Step 4: build to temp file, stream output
-    temp_path, build_output = build_model_on_jetson(
-        ip, user, db3_path, remote_model,
-        args.voxel_size, args.max_frames)
-
-    # Step 5: validate voxel count, then atomically rename temp → final
-    validate_and_promote_model(ip, user, temp_path, remote_model, build_output)
-
-    # Step 6: download (only reached after successful promotion)
-    download_model(ip, user, remote_model, local_model)
-
-    # Trigger NAS archive hook for the new model if NAS is configured.
-    # Uses check=False so a NAS connectivity problem never aborts a successful rebuild.
-    if Path.home().joinpath(".nas_password").exists():
-        hook = Path(__file__).parent / "post_record_hook.py"
-        subprocess.run(
-            [sys.executable, str(hook),
-             "--with-model", "--node", args.node],
-            check=False,
-        )
-
-    if not args.keep_bag:
-        cleanup_bag(ip, user, bag_name)
-
-    print_next_steps(local_model, args.config, args.node)
+    # Single-node path: interactive=True (prompts active), nas_lock=None, abort=None.
+    ok = run_single_node(args.node, args, args.config)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':
