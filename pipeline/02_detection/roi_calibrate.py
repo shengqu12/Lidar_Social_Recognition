@@ -14,10 +14,13 @@ import argparse
 import base64
 import json
 import struct
+import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
+import yaml
 
 try:
     import websocket
@@ -149,16 +152,47 @@ def text_histogram_2d(all_pts, grid=20):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _load_node_config(config_path: str, node_name: str) -> dict:
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    nodes = data.get('nodes', {})
+    if node_name not in nodes:
+        print(f"ERROR: node '{node_name}' not found in {config_path}")
+        sys.exit(1)
+    return nodes[node_name]
+
+
 def main():
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent.parent
+    default_config = str(project_root / "config" / "nodes_config.yaml")
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--jetson_ip", default="172.26.42.167")
-    ap.add_argument("--port", type=int, default=9090)
-    ap.add_argument("--topic", default="/livox/lidar_foreground")
+    ap.add_argument("--config", default=default_config,
+                    help="Path to nodes_config.yaml")
+    ap.add_argument("--node", default="node1",
+                    help="Node name from nodes_config.yaml (default: node1)")
+    ap.add_argument("--jetson_ip", default=None,
+                    help="Jetson IP (default: from config)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="Rosbridge port (default: from config)")
+    ap.add_argument("--topic", default=None,
+                    help="Foreground topic (default: from config)")
     ap.add_argument("--duration", type=float, default=10.0,
                     help="Collection time in seconds (default 10)")
     args = ap.parse_args()
 
-    url = f"ws://{args.jetson_ip}:{args.port}"
+    # Resolution order: CLI arg > config value > hardcoded default
+    cfg = {}
+    try:
+        cfg = _load_node_config(args.config, args.node)
+    except FileNotFoundError:
+        pass  # config absent — fall back to hardcoded defaults
+    jetson_ip = args.jetson_ip or cfg.get('jetson_ip', '172.26.42.167')
+    port      = args.port      if args.port is not None else cfg.get('rosbridge_port', 9090)
+    topic     = args.topic     or cfg.get('foreground_topic', '/livox/lidar_foreground')
+
+    url = f"ws://{jetson_ip}:{port}"
     all_pts = []
     frame_count = [0]
     lock = threading.Lock()
@@ -168,13 +202,13 @@ def main():
             all_pts.append(pts)
             frame_count[0] += 1
 
-    ws = _WS(url, args.topic, "sensor_msgs/msg/PointCloud2", on_pts)
+    ws = _WS(url, topic, "sensor_msgs/msg/PointCloud2", on_pts)
     t = threading.Thread(target=ws.run, daemon=True)
     t.start()
 
     print(f"Connecting to {url} ...")
     time.sleep(1.5)
-    print(f"Collecting {args.duration:.0f} s of '{args.topic}'")
+    print(f"Collecting {args.duration:.0f} s of '{topic}'")
 
     deadline = time.time() + args.duration
     while time.time() < deadline:
@@ -188,7 +222,7 @@ def main():
     with lock:
         if not all_pts:
             print("ERROR: No points received. Is the Jetson pipeline running?")
-            print(f"  Try: ssh kelrod@{args.jetson_ip} 'ros2 topic list'")
+            print(f"  Try: ssh kelrod@{jetson_ip} 'ros2 topic list'")
             return
         combined = np.vstack(all_pts)
 

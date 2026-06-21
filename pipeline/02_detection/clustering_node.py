@@ -249,6 +249,8 @@ class RosBridgeClient:
     Uses websocket-client directly to avoid roslibpy blocking issues.
     """
 
+    debug: bool = False  # set RosBridgeClient.debug = True via --debug to enable per-frame logs
+
     def __init__(self, host: str, port: int):
         self.url = f"ws://{host}:{port}"
         self._topic_callbacks = {}
@@ -278,6 +280,9 @@ class RosBridgeClient:
         self._connected_event.set()
 
     def _on_message(self, ws, raw):
+        if RosBridgeClient.debug:
+            print(f"[DBG _on_message] {self.url}  type={type(raw).__name__}  "
+                  f"len={len(raw) if raw else 0}  first50={repr(raw[:50]) if raw else ''}", flush=True)
         try:
             data = json.loads(raw)
         except Exception:

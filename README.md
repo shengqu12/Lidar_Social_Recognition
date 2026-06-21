@@ -1,161 +1,90 @@
 # LiDAR Social Recognition
 
-NSF SAI Project (Award #2425121) — Studying how Hunt Library's physical space layout shapes spontaneous social interaction and social capital formation among students.
+Indoor multi-LiDAR sensing pipeline for studying how the physical layout of a
+shared space shapes spontaneous social interaction. Ceiling-mounted Livox
+MID-360 sensors on Jetson edge nodes produce point clouds; an offline pipeline
+removes the static background, detects and tracks people, and derives
+encounters between them. Developed for deployment in the Hunt Library
+congregation area (CMU NSF SAI Award #2425121).
 
-**Institution:** Carnegie Mellon University  
-**Advisors:** Prof. Mario Berges (CEE/HCI), Prof. Katherine Flanigan  
-**Hardware:** Livox Mid-360 LiDAR sensors, NVIDIA Jetson Orin Nano nodes
+The system currently runs a **dual-LiDAR fused pipeline** (node1 + node3,
+overlapping fields of view, ICP-calibrated into a common frame). It is offline
+by design: recording happens on the Jetsons, inference runs on the development
+workstation.
 
----
+## Quickstart
 
-## Pipeline Overview
-
-```
-Livox Mid-360 (ceiling-mounted, inverted)
-          |
-          v  /livox/lidar
-  [00] launcher.py  ──── SSH ────>  Jetson (172.26.42.167)
-                                      |
-                                      v  ROS2 Humble
-                              [01] statistical_bg_node.py
-                                    (background removal)
-                                      |
-                                      v  /livox/lidar_foreground
-                              rosbridge ws://jetson:9090
-                                      |
-          <────────── roslibpy ───────+
-          |
-          v  /livox/lidar_foreground
-  [02] clustering_node.py  (local, conda activate livox)
-       Euclidean clustering → person bounding boxes
-          |
-          +──> /detection_boxes   (MarkerArray, Foxglove)
-          +──> /detection_centers (PointCloud2, for tracking)
-          |
-          v
-  [03] tracking/  (pending — AB3DMOT)
-          |
-          v
-  [04] collision_detection.py
-       proximity + heading + deceleration → encounter events
-          |
-          v  encounters_raw.csv
-  [05] visualize_detections.py
-       Replays .bin frames + prediction boxes in Foxglove
-```
-
----
-
-## Repository Structure
-
-```
-lidar_social_recognition/
-├── config/
-│   └── nodes_config.yaml            # Node-specific settings (Jetson IPs, topics, params)
-├── pipeline/
-│   ├── 00_start_driver_rosbridge/   # One-script launcher: rosbridge + LiDAR driver + BG node on Jetson
-│   ├── 01_background_removal/       # Statistical BG model builder + ROS2 filtering node
-│   ├── 02_detection/                # Euclidean clustering node (runs locally via roslibpy)
-│   ├── 03_tracking/                 # AB3DMOT multi-object tracker
-│   ├── 04_encounter_detection/      # Proximity + heading + deceleration encounter detector
-│   └── 05_visualization/            # ROS2 node: replay .bin frames + detection boxes in Foxglove
-├── eval/
-│   ├── load_atc.py                  # Load ATC pedestrian dataset, detect encounters
-│   └── validation.py                # Precision / Recall / F1 evaluation against ATC ground truth
-├── dataset/
-│   ├── ATC_dataset/                 # ATC pedestrian CSV + group interaction ground truth
-│   ├── hunt_library_bins/           # .bin point cloud frames (x y z intensity, float32)
-│   └── human_test_20260607_154314/  # ROS2 bag recorded during live test
-├── data/
-│   └── encounters/                  # Output CSV: encounters_raw.csv
-└── card_reader/                     # Card reader data collection (separate sub-project)
-```
-
----
-
-## Quick Start
-
-**Prerequisites:** SSH access to Jetson at `172.26.42.167` (user `kelrod`), background model already built and copied to `~/background_statistical.npz` on the Jetson.
+Bring up the full fused pipeline (both LiDARs, background removal, fusion
+overlay, and tracking) with one command:
 
 ```bash
-# Start rosbridge + LiDAR driver + BG removal on Jetson
-python3 pipeline/00_start_driver_rosbridge/launcher.py --start
-
-# Check that all three services are running
-python3 pipeline/00_start_driver_rosbridge/launcher.py --status
-
-# Start Jetson services AND immediately launch clustering locally
-python3 pipeline/00_start_driver_rosbridge/launcher.py --start --with-clustering
-
-# Run only clustering locally (Jetson already running)
-conda activate livox
-python3 pipeline/02_detection/clustering_node.py \
-    --jetson_ip 172.26.42.167 \
-    --topic /livox/lidar_foreground
-
-# Stop all Jetson services
-python3 pipeline/00_start_driver_rosbridge/launcher.py --stop
+python3 pipeline/00_start_driver_rosbridge/launcher.py --start --node fused --with-tracking
 ```
 
-**Build the background model** (run once from an empty-scene rosbag):
+Stop it (by default this stops only the local overlay/tracking; add
+`--stop-deps` to also stop node1/node3):
 
 ```bash
-python3 pipeline/01_background_removal/statistical_bg_build.py \
-    --bag ./data/rosbags/empty_scene \
-    --output ./models/background_statistical.npz
-
-scp ./models/background_statistical.npz kelrod@172.26.42.167:~/
+python3 pipeline/00_start_driver_rosbridge/launcher.py --stop --node fused
 ```
 
----
+Check what is running:
 
-## Hardware Setup
+```bash
+python3 pipeline/00_start_driver_rosbridge/launcher.py --status --node fused
+```
 
-| Parameter | Value |
-|---|---|
-| Jetson IP | 172.26.42.167 |
-| Jetson user | kelrod |
-| SSH port | 22 |
-| rosbridge websocket port | 9090 |
-| LiDAR ROS topic | /livox/lidar |
-| Foreground topic | /livox/lidar_foreground |
-| LiDAR driver | livox_ros_driver2 (msg_MID360_launch.py) |
-| ROS distribution | ROS2 Humble |
+Rebuild background models for both physical nodes (records an empty scene on
+each Jetson and builds a fresh statistical model):
 
-**Foxglove visualization:** Connect to `ws://172.26.42.167:9090` and add PointCloud2 panels for `/livox/lidar`, `/livox/lidar_foreground`, and a MarkerArray panel for `/detection_boxes`.
+```bash
+python3 pipeline/00_start_driver_rosbridge/rebuild_background.py --node fused
+```
 
----
+A single physical node can always be targeted directly with `--node node1` or
+`--node node3`.
 
-## Background Removal Parameters
+## Repository layout
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| sigma | 2.0 | Points more than sigma * std from background mean are foreground |
-| z_min | -2.8 m | Minimum z (sensor inverted, so negative) |
-| z_max | -0.5 m | Maximum z (cuts off ceiling plane) |
-| voxel_size | 0.10 m | Spatial resolution of background model |
+```
+config/
+  nodes_config.yaml          Single source of truth: per-node params,
+                             the fused virtual node, and the fusion section
+                             (ICP transform, sources, output topic).
 
----
+pipeline/                    The processing stages, in execution order:
+  00_start_driver_rosbridge/ launcher, NAS archiver, background rebuild
+  01_background_removal/      statistical background model build + removal node
+  02_detection/              Euclidean clustering person detection, ROI tools
+  03_tracking/               AB3DMOT-style tracking, behaviour classification
+  04_encounter_detection/    collision / encounter detection
+  05_visualization/          detection + box visualisation
+  06_fusion/                 dual-LiDAR overlay node, fused-detection verifier
 
-## Validation
+eval/                        ATC-dataset loading, validation, detection and
+                             tracking parameter sweeps.
 
-Encounter detection is validated against the ATC pedestrian dataset (`dataset/ATC_dataset/`). The ATC CSV files contain columns `timestamp, person_id, x, y, z, velocity, angle1, angle2` with coordinates in millimeters (converted to meters on load). Ground truth social interaction pairs are in `groups_ATC-1.dat` (interaction type 1 = genuine social interaction).
+models/                      Per-node statistical background models (.npz).
 
-The encounter detection pipeline in `eval/load_atc.py` applies: (1) displacement filter (>1.0 m total travel), (2) artifact ID removal (persons appearing in >30% of frames), (3) proximity check (distance < 1.5 m), (4) heading check (angle difference >= 90 degrees), (5) deceleration filter (velocity drop > 0.2 m/s in approach window), (6) deduplication (same pair within 3.0 s counts once). Precision/Recall/F1 are computed in `eval/validation.py`. The paper baseline cited in the source is Precision = 0.861.
+calib_out/                   ICP calibration output (node3 → node1 transform).
 
----
+docs/                        Full documentation (see below).
+```
 
-## Dependencies
+## Documentation
 
-| Package | Used in |
-|---|---|
-| numpy | all modules |
-| scipy (KDTree) | clustering_node.py |
-| pandas | load_atc.py, validation.py |
-| matplotlib | load_atc.py, validation.py |
-| rclpy (ROS2 Humble) | statistical_bg_node.py, visualize_detections.py |
-| sensor_msgs, visualization_msgs | statistical_bg_node.py, visualize_detections.py |
-| roslibpy | clustering_node.py |
-| rosbag2_py | statistical_bg_build.py |
+| Doc | Covers |
+|-----|--------|
+| [docs/architecture.md](docs/architecture.md) | Dual-LiDAR fusion, the pipeline stages and data flow, the fused virtual node, the single-source config model |
+| [docs/setup.md](docs/setup.md) | Workstation setup: Ubuntu, ROS2 Jazzy, the `livox` conda env, CUDA for the RTX 5070, building `livox_ros_driver2` |
+| [docs/hardware_network.md](docs/hardware_network.md) | Nodes and IPs, **MID-360 vs MID-360S differences**, campus networking and Tailscale, the NAS and its safety rules, clock sync |
+| [docs/calibration_tuning.md](docs/calibration_tuning.md) | ICP calibration (the 180° symmetry trap and how it's resolved), background voxel sizing, ROI, static-person handling, detection/tracking parameters and their rationale |
+| [docs/operations.md](docs/operations.md) | Runbook: every launcher command and flag, background rebuild (including the parallel fused rebuild), and troubleshooting |
 
-Conda environment for local (non-Jetson) modules: `livox`
+## Status
+
+Dual-LiDAR fusion is implemented and verified end to end: node3 is configured
+and calibrated to node1's frame, clocks are synchronised, the fused foreground
+feeds detection and tracking, and ghost-track suppression and static-person
+detection are in place. Full Hunt Library deployment, including ROI re-tuning
+for the real space and additional MID-360S nodes, is scheduled for July 2026.

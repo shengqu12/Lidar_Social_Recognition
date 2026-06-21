@@ -93,8 +93,14 @@ class StaticZoneFilter:
         self._threshold = float(density_threshold)
         self._min_history = int(min_history)
 
-    def filter(self, detections: List[dict]) -> List[dict]:
-        """Return only detections that are NOT in a persistent static zone."""
+    def filter(self, detections: List[dict],
+               whitelist_xy: Optional[List[Tuple[float, float]]] = None) -> List[dict]:
+        """Return only detections that are NOT in a persistent static zone.
+
+        Detections within self._radius of any position in whitelist_xy bypass
+        suppression — used to protect detections near confirmed active tracks
+        so that stationary people are not removed along with furniture.
+        """
         centers_now = [
             (float(d["center"][0]), float(d["center"][1]))
             for d in detections
@@ -104,6 +110,16 @@ class StaticZoneFilter:
         filtered = []
 
         for i, (cx, cy) in enumerate(centers_now):
+            # Never suppress a detection that is near a confirmed track.
+            # The whitelist uses the previous-frame Kalman position, which
+            # predicts forward even during brief coasting gaps.
+            if whitelist_xy and any(
+                np.hypot(cx - wx, cy - wy) < self._radius
+                for wx, wy in whitelist_xy
+            ):
+                filtered.append(detections[i])
+                continue
+
             if n_history < self._min_history:
                 filtered.append(detections[i])
             else:
@@ -219,7 +235,9 @@ class LiveTracker:
                  static_suppress_dist: float = 0.30,
                  direction_weight: float = 0.5,
                  direction_min_speed: float = 0.3,
-                 coast_velocity_decay: float = 1.0):
+                 coast_velocity_decay: float = 1.0,
+                 merge_dist: float = 0.40,
+                 merge_min_frames: int = 5):
         # Kalman dt from observed frame rate
         dt = 1.0 / max(1.0, fps)
 
@@ -234,8 +252,15 @@ class LiveTracker:
         self._suppress_frames = int(static_suppress_frames)
         self._suppress_dist   = float(static_suppress_dist)
         self._coast_decay     = float(coast_velocity_decay)
+        self._merge_dist      = float(merge_dist)
+        self._merge_min_frames = int(merge_min_frames)
         # position history per track: track_id -> deque of (x, y) arrays
         self._pos_history: dict = {}
+        # per-track EMA of bounding-box size (α=0.3), matching eval _Trk.sz
+        # smoothing to stabilise the Re-ID [height, footprint] descriptor
+        self._sz_ema: dict = {}
+        # ghost-merge state: (id_lo, id_hi) → consecutive frames within merge_dist
+        self._merge_counter: Dict[Tuple[int, int], int] = {}
 
         self._tracker = DirectionAwareTracker(
             direction_weight=direction_weight,
@@ -330,6 +355,12 @@ class LiveTracker:
                 "time_since_update": o["time_since_update"],
             })
 
+        # Merge ghost tracks: drop tracks whose centroid has been within
+        # merge_dist metres of a more-confirmed track for merge_min_frames
+        # consecutive frames.  The ghost is also force-killed inside AB3DMOT
+        # so it cannot re-emerge via Hungarian assignment next frame.
+        raw_tracks = self._merge_duplicate_tracks(raw_tracks)
+
         # Update position history and apply static suppression.
         # A track whose maximum displacement over the last N positions is less
         # than the threshold is classified as a stationary object (furniture)
@@ -338,6 +369,9 @@ class LiveTracker:
         dead_ids   = set(self._pos_history.keys()) - active_ids
         for dead in dead_ids:
             del self._pos_history[dead]
+            self._sz_ema.pop(dead, None)
+            for k in [k for k in self._merge_counter if dead in k]:
+                self._merge_counter.pop(k, None)
 
         tracks = []
         for t in raw_tracks:
@@ -346,6 +380,14 @@ class LiveTracker:
             if tid not in self._pos_history:
                 self._pos_history[tid] = deque(maxlen=self._suppress_frames)
             self._pos_history[tid].append(xy)
+
+            # EMA size smoothing (α=0.3): stabilises Re-ID descriptor variance.
+            raw_sz = t["size"]
+            if tid in self._sz_ema:
+                t["size"] = 0.3 * raw_sz + 0.7 * self._sz_ema[tid]
+            else:
+                t["size"] = raw_sz.copy()
+            self._sz_ema[tid] = t["size"]
 
             hist = self._pos_history[tid]
             if len(hist) >= self._suppress_frames:
@@ -358,11 +400,251 @@ class LiveTracker:
 
         return tracks
 
+    def _merge_duplicate_tracks(self, raw_tracks: List[dict]) -> List[dict]:
+        """
+        Suppress ghost tracks that shadow a more-confirmed real track.
+
+        Two confirmed tracks within merge_dist metres for merge_min_frames
+        consecutive frames are treated as a duplicate pair: the less-confirmed
+        one is dropped from the output list AND force-killed from AB3DMOT's
+        internal state so it cannot re-emerge via Hungarian assignment.
+
+        Selection criterion — keep the track with (in priority order):
+          1. More matched frames (hits)
+          2. Currently matched this frame (time_since_update == 0)
+          3. Lower track ID (created earlier → original track)
+
+        When three or more tracks are all mutually close (e.g. four ghost IDs on
+        one person), pairs are processed longest-standing-first; once an ID is
+        queued for dropping it is skipped as a candidate "winner" to avoid
+        contradictory decisions.
+        """
+        if self._merge_dist <= 0.0 or len(raw_tracks) < 2:
+            return raw_tracks
+
+        def _score(t: dict) -> tuple:
+            # Higher tuple = "more real": more hits, currently matched, older ID
+            return (t["hits"], -t["time_since_update"], -t["id"])
+
+        # Update close-pair frame counters
+        current_pairs: set = set()
+        for i in range(len(raw_tracks)):
+            for j in range(i + 1, len(raw_tracks)):
+                ti, tj = raw_tracks[i], raw_tracks[j]
+                d = np.hypot(float(ti["center"][0]) - float(tj["center"][0]),
+                             float(ti["center"][1]) - float(tj["center"][1]))
+                if d < self._merge_dist:
+                    key = (min(ti["id"], tj["id"]), max(ti["id"], tj["id"]))
+                    current_pairs.add(key)
+                    self._merge_counter[key] = self._merge_counter.get(key, 0) + 1
+
+        # Expire counters for pairs that are no longer close
+        for k in [k for k in self._merge_counter if k not in current_pairs]:
+            del self._merge_counter[k]
+
+        if not any(c >= self._merge_min_frames for c in self._merge_counter.values()):
+            return raw_tracks
+
+        id_to_track = {t["id"]: t for t in raw_tracks}
+        drop_ids: set = set()
+
+        # Process longest-standing pairs first so the most persistent ghost is
+        # evicted first; skip if either ID is already being dropped this frame.
+        for (id_a, id_b), count in sorted(self._merge_counter.items(),
+                                           key=lambda kv: -kv[1]):
+            if count < self._merge_min_frames:
+                continue
+            if id_a in drop_ids or id_b in drop_ids:
+                continue
+            ta = id_to_track.get(id_a)
+            tb = id_to_track.get(id_b)
+            if ta is None or tb is None:
+                continue
+            if _score(ta) >= _score(tb):
+                ghost_id, keep_id = id_b, id_a
+            else:
+                ghost_id, keep_id = id_a, id_b
+            drop_ids.add(ghost_id)
+            if count == self._merge_min_frames:   # log once per pair
+                print(f"[merge] ghost #{ghost_id} folded into #{keep_id} "
+                      f"(hits {id_to_track[ghost_id]['hits']} vs "
+                      f"{id_to_track[keep_id]['hits']}, "
+                      f"dist<{self._merge_dist:.2f}m for {count} frames)")
+
+        if not drop_ids:
+            return raw_tracks
+
+        # Force-kill the dropped IDs from AB3DMOT so they cannot re-emerge.
+        self._tracker.tracks = [trk for trk in self._tracker.tracks
+                                 if trk.id not in drop_ids]
+
+        # Purge our auxiliary state for the killed IDs now; the dead_ids loop
+        # in step() won't see them (they're already gone from pos_history).
+        for did in drop_ids:
+            self._pos_history.pop(did, None)
+            self._sz_ema.pop(did, None)
+            for k in [k for k in self._merge_counter if did in k]:
+                self._merge_counter.pop(k, None)
+
+        return [t for t in raw_tracks if t["id"] not in drop_ids]
+
     def _get_track(self, track_id: int) -> Optional[object]:
         for trk in self._tracker.tracks:
             if trk.id == track_id:
                 return trk
         return None
+
+
+# ─── Adaptive frame accumulation ─────────────────────────────────────────────
+
+def _adaptive_accum_merge(
+    frame_buf: deque,
+    tracker: "LiveTracker",
+    cfg: dict,
+) -> np.ndarray:
+    """
+    Build a merged point cloud with per-region, velocity-dependent accumulation.
+
+    For each point in the rolling buffer, inclusion depends on the speed of the
+    nearest previous-frame track (Kalman state from the last step() call):
+
+      speed ≤ low_speed_thr  → include up to max_frames   (stationary: densify)
+      speed ≥ high_speed_thr → include only min_frames     (walking: avoid streak)
+      between thresholds     → linearly interpolated frame count
+
+    Points not within assoc_radius of any active track use cold_start_frames.
+
+    Chicken-and-egg ordering: tracker velocities are from the PREVIOUS step(),
+    so this function is purely read-only with respect to the tracker state.
+    """
+    min_f   = int(cfg["min_frames"])
+    max_f   = int(cfg["max_frames"])
+    lo_thr  = float(cfg["low_speed_thr"])
+    hi_thr  = float(cfg["high_speed_thr"])
+    cold_f  = int(cfg["cold_start_frames"])
+    assoc_r = float(cfg.get("assoc_radius", 1.5))
+
+    n_buf = len(frame_buf)
+    if n_buf == 0:
+        return np.zeros((0, 3), np.float32)
+
+    buf = list(frame_buf)  # oldest → newest; newest is buf[-1]
+
+    # Read track positions and speed-derived frame counts from Kalman state.
+    track_info: List[Tuple[float, float, int]] = []  # (cx, cy, n_frames)
+    for trk in tracker._tracker.tracks:
+        cx  = float(trk.kf.x[0, 0])
+        cy  = float(trk.kf.x[1, 0])
+        # Coasting tracks have dampened velocity (coast_velocity_decay < 1). Using
+        # that dampened speed would wrongly classify a fast coasting track as slow
+        # and over-accumulate old frames, recreating the split-cluster artifact.
+        # Fall back to cold_start_frames for coasting tracks.
+        if trk.time_since_update > 0:
+            nf = cold_f
+        else:
+            vx  = float(trk.kf.x[3, 0])
+            vy  = float(trk.kf.x[4, 0])
+            spd = math.sqrt(vx * vx + vy * vy)
+            if spd <= lo_thr:
+                nf = max_f
+            elif spd >= hi_thr:
+                nf = min_f
+            else:
+                alpha = (spd - lo_thr) / (hi_thr - lo_thr)
+                nf = int(round(max_f * (1.0 - alpha) + min_f * alpha))
+        track_info.append((cx, cy, nf))
+
+    if not track_info:
+        # Cold start — no tracks yet; use cold_start_frames of the buffer
+        n_use = min(cold_f, n_buf)
+        parts = buf[-n_use:]
+        return np.vstack(parts) if parts else np.zeros((0, 3), np.float32)
+
+    t_pos = np.array([[cx, cy] for cx, cy, _ in track_info], dtype=np.float32)  # (N, 2)
+    t_nf  = np.array([nf for _, _, nf in track_info], dtype=np.int32)            # (N,)
+
+    selected: List[np.ndarray] = []
+    for age in range(n_buf):
+        # age 0 = newest frame (buf[-1]); age n_buf-1 = oldest (buf[0])
+        frame = buf[-(age + 1)]
+        if len(frame) == 0:
+            continue
+
+        pts2d   = frame[:, :2]                                         # (P, 2)
+        diffs   = pts2d[:, None, :] - t_pos[None, :, :]               # (P, N, 2)
+        dists   = np.linalg.norm(diffs, axis=2)                        # (P, N)
+        nn_idx  = np.argmin(dists, axis=1)                             # (P,)
+        nn_dist = dists[np.arange(len(pts2d)), nn_idx]                 # (P,)
+
+        near   = nn_dist < assoc_r
+        pt_nf  = t_nf[nn_idx]                                          # (P,) n_frames for nearest track
+
+        include = (near & (age < pt_nf)) | (~near & (age < cold_f))
+        if include.any():
+            selected.append(frame[include])
+
+    return np.vstack(selected) if selected else np.zeros((0, 3), np.float32)
+
+
+# ─── Geometric Re-ID bank ────────────────────────────────────────────────────
+
+_REID_MAX_SPEED = 3.0   # m/s — spatial plausibility gate (eval MAX_SPEED)
+
+
+class _ReIDBank:
+    """
+    Records recently-lost canonical track IDs for potential revival.
+
+    Descriptor: height (z-span) + footprint (sx*sy) — exactly two dims, no velocity.
+    Revival requires BOTH:
+      (1) spatial gap ≤ _REID_MAX_SPEED × elapsed  (physically plausible)
+      (2) normalised descriptor distance < threshold
+    Faithful port of _ReIDBank from eval/tracking_maintenance_sweep.py.
+    """
+
+    def __init__(self, threshold: float, max_age_sec: float = 15.0):
+        self.thr       = threshold
+        self._max_age  = max_age_sec
+        self._bank: Dict[int, dict] = {}
+
+    def record(self, cid: int, pos: np.ndarray, sz: np.ndarray, t: float):
+        self._bank[cid] = {
+            "xy": pos[:2].copy(),
+            "sz": float(sz[2]),                    # z-span (height)
+            "fp": float(sz[0]) * float(sz[1]),     # xy footprint
+            "t":  t,
+        }
+
+    def match(self, pos: np.ndarray, sz: np.ndarray, t: float) -> Optional[int]:
+        """Return canonical ID of best match (and consume it from bank), or None."""
+        det_xy = pos[:2].copy()
+        det_sz = float(sz[2])
+        det_fp = float(sz[0]) * float(sz[1])
+
+        expired = [cid for cid, r in self._bank.items()
+                   if (t - r["t"]) > self._max_age]
+        for cid in expired:
+            del self._bank[cid]
+
+        best_id, best_score = None, float("inf")
+        for cid, rec in self._bank.items():
+            elapsed = t - rec["t"]
+            max_gap = _REID_MAX_SPEED * max(elapsed, 0.0)
+            dist    = float(np.linalg.norm(det_xy - rec["xy"]))
+            if dist > max_gap:
+                continue   # spatial plausibility gate
+
+            h_diff  = abs(det_sz - rec["sz"]) / max(rec["sz"],  0.10)
+            fp_diff = abs(det_fp - rec["fp"]) / max(rec["fp"],  0.01)
+            score   = (h_diff + fp_diff) / 2.0
+
+            if score < best_score and score < self.thr:
+                best_score = score
+                best_id    = cid
+
+        if best_id is not None:
+            del self._bank[best_id]   # consume — each canonical ID matched at most once
+        return best_id
 
 
 # ─── CSV logger ───────────────────────────────────────────────────────────────
@@ -644,7 +926,8 @@ class TrackingNode:
                  filter_cfg: dict,
                  tracking_cfg: dict,
                  behavior_cfg: dict,
-                 csv_dir: Path):
+                 csv_dir: Path,
+                 adaptive_accum_cfg: Optional[dict] = None):
 
         self.cluster_tol  = cluster_tol
         self.min_points   = min_points
@@ -653,18 +936,27 @@ class TrackingNode:
         self.accum_frames = max(1, accum_frames)
         self.roi_cfg      = roi_cfg
         self.filter_cfg   = filter_cfg
+        self._adaptive_accum_cfg: Optional[dict] = (
+            adaptive_accum_cfg if (adaptive_accum_cfg and
+                                   adaptive_accum_cfg.get("enabled", False))
+            else None
+        )
 
-        max_age         = int(tracking_cfg.get("max_age",   5))
-        min_hits        = int(tracking_cfg.get("min_hits",  3))
-        max_dist        = float(tracking_cfg.get("max_association_dist", 1.0))
-        suppress_frames = int(tracking_cfg.get("static_suppress_frames", 20))
-        suppress_dist   = float(tracking_cfg.get("static_suppress_dist",  0.30))
-        do_csv          = bool(tracking_cfg.get("csv_logging", True))
-        direction_w     = float(tracking_cfg.get("direction_weight", 0.5))
-        direction_spd   = float(tracking_cfg.get("direction_min_speed", 0.3))
-        coast_decay     = float(tracking_cfg.get("coast_velocity_decay", 1.0))
+        max_age          = int(tracking_cfg.get("max_age",   5))
+        min_hits         = int(tracking_cfg.get("min_hits",  3))
+        max_dist         = float(tracking_cfg.get("max_association_dist", 1.0))
+        suppress_frames  = int(tracking_cfg.get("static_suppress_frames", 20))
+        suppress_dist    = float(tracking_cfg.get("static_suppress_dist",  0.30))
+        do_csv           = bool(tracking_cfg.get("csv_logging", True))
+        direction_w      = float(tracking_cfg.get("direction_weight", 0.5))
+        direction_spd    = float(tracking_cfg.get("direction_min_speed", 0.3))
+        coast_decay      = float(tracking_cfg.get("coast_velocity_decay", 1.0))
+        merge_dist       = float(tracking_cfg.get("merge_dist",       0.40))
+        merge_min_frames = int(tracking_cfg.get("merge_min_frames",  5))
 
-        self._frame_buf: deque = deque(maxlen=self.accum_frames)
+        _buf_size = (int(self._adaptive_accum_cfg["max_frames"])
+                     if self._adaptive_accum_cfg else self.accum_frames)
+        self._frame_buf: deque = deque(maxlen=_buf_size)
         self._frame_count = 0
         self._rejected_count = 0
         self._vert_rejected_buf: list = []  # z-extents of furniture-rejected clusters
@@ -683,6 +975,8 @@ class TrackingNode:
             direction_weight=direction_w,
             direction_min_speed=direction_spd,
             coast_velocity_decay=coast_decay,
+            merge_dist=merge_dist,
+            merge_min_frames=merge_min_frames,
         )
 
         self.static_filter = StaticZoneFilter(
@@ -691,6 +985,16 @@ class TrackingNode:
             density_threshold=float(tracking_cfg.get("static_zone_density", 0.75)),
             min_history=int(tracking_cfg.get("static_zone_min_history", 15)),
         )
+
+        reid_thr     = float(tracking_cfg.get("reid_thr",         0.5))
+        reid_max_age = float(tracking_cfg.get("reid_max_age_sec", 15.0))
+        if reid_thr > 0.0:
+            self._reid_bank       = _ReIDBank(reid_thr, reid_max_age)
+            self._reid_id_remap   : Dict[int, int]  = {}
+            self._reid_last_known : Dict[int, dict] = {}
+            self._reid_prev_ids   : set             = set()
+        else:
+            self._reid_bank = None
 
         self.behavior_clf = BehaviorClassifier(behavior_cfg)
 
@@ -719,11 +1023,72 @@ class TrackingNode:
         print(f"  Output: /tracked_boxes, /tracked_centers")
         print(f"  Tracker: max_age={max_age}  min_hits={min_hits}  "
               f"max_dist={max_dist}m  accum={self.accum_frames}frames")
+        print(f"  Merge:   dist<{merge_dist:.2f}m x{merge_min_frames}fr → ghost dropped")
+        sz_r   = float(tracking_cfg.get("static_zone_radius",      0.5))
+        sz_d   = float(tracking_cfg.get("static_zone_density",     0.75))
+        sz_mh  = int(tracking_cfg.get("static_zone_min_history",  15))
+        print(f"  StaticZone: r={sz_r}m density={sz_d} min_hist={sz_mh} "
+              f"[confirmed-track whitelist ON]")
         print(f"  Direction: weight={direction_w}  min_speed={direction_spd}m/s")
         if roi_cfg.get("enabled"):
             print(f"  ROI:    x[{roi_cfg['x_min']},{roi_cfg['x_max']}]  "
                   f"y[{roi_cfg['y_min']},{roi_cfg['y_max']}]")
         print(f"  Behavior: {'enabled' if behavior_cfg.get('enabled', True) else 'disabled'}")
+        if self._reid_bank is not None:
+            print(f"  Re-ID:  thr={reid_thr}  max_age={reid_max_age}s")
+        else:
+            print(f"  Re-ID:  disabled (reid_thr=0)")
+
+    # ── geometric Re-ID ───────────────────────────────────────────────────────
+
+    def _apply_reid(self, tracks: List[dict], t: float) -> List[dict]:
+        """
+        Revive canonical IDs for reappearing people before spawning new ones.
+
+        Runs after coasting/max_age pruning (inside LiveTracker.step) has already
+        failed to keep a track alive — this is the last fallback before a new
+        incrementing ID is assigned.
+
+        Faithful port of the _ReIDBank usage in eval/tracking_maintenance_sweep.py
+        run_one() (lines 398-412).
+        """
+        if self._reid_bank is None:
+            return tracks
+
+        cur_ids = {trk["id"] for trk in tracks}
+
+        # Update last-known state for all currently active raw IDs
+        for trk in tracks:
+            self._reid_last_known[trk["id"]] = {
+                "pos": trk["center"].copy(),
+                "sz":  trk["size"].copy(),
+                "t":   t,
+            }
+
+        # Register deaths: tracks that were active last frame but not this frame
+        for dead_rid in self._reid_prev_ids - cur_ids:
+            if dead_rid in self._reid_last_known:
+                cid = self._reid_id_remap.get(dead_rid, dead_rid)
+                r   = self._reid_last_known.pop(dead_rid)
+                self._reid_bank.record(cid, r["pos"], r["sz"], r["t"])
+
+        # Attempt revival: new raw IDs that just appeared this frame
+        for new_rid in cur_ids - self._reid_prev_ids:
+            trk_obj = next(tr for tr in tracks if tr["id"] == new_rid)
+            matched = self._reid_bank.match(trk_obj["center"], trk_obj["size"], t)
+            if matched is not None:
+                self._reid_id_remap[new_rid] = matched
+
+        self._reid_prev_ids = cur_ids
+
+        # Apply canonical-ID remapping to output tracks
+        result = []
+        for trk in tracks:
+            cid = self._reid_id_remap.get(trk["id"], trk["id"])
+            out = dict(trk)
+            out["id"] = cid
+            result.append(out)
+        return result
 
     # ── callback ──────────────────────────────────────────────────────────────
 
@@ -746,10 +1111,20 @@ class TrackingNode:
             pts = apply_roi(pts, self.roi_cfg)
 
         self._frame_buf.append(pts)
-        if len(self._frame_buf) < self.accum_frames:
-            return
 
-        merged = np.vstack(list(self._frame_buf))
+        if self._adaptive_accum_cfg is not None:
+            # Adaptive mode: merge based on per-region track speed from previous step.
+            # Always proceed once we have at least one frame.
+            if not self._frame_buf:
+                return
+            merged = _adaptive_accum_merge(
+                self._frame_buf, self.tracker, self._adaptive_accum_cfg
+            )
+        else:
+            # Fixed-accum mode: wait for buffer to fill before processing.
+            if len(self._frame_buf) < self.accum_frames:
+                return
+            merged = np.vstack(list(self._frame_buf))
 
         # Detect (vertical rejections are accumulated in _vert_rejected_buf
         # and logged every 20 frames for furniture threshold tuning)
@@ -764,11 +1139,25 @@ class TrackingNode:
             _vert_rejected=self._vert_rejected_buf,
         )
 
-        # Remove detections that are persistently at a static location (furniture)
-        detections = self.static_filter.filter(detections)
+        # Build whitelist of confirmed track positions (previous-frame Kalman
+        # predictions) so stationary people with an established track are never
+        # suppressed by the static zone filter — only furniture without any
+        # associated track gets removed.
+        _confirmed_xy: List[Tuple[float, float]] = [
+            (float(trk.kf.x[0, 0]), float(trk.kf.x[1, 0]))
+            for trk in self.tracker._tracker.tracks
+            if trk.hits >= self.tracker._min_hits
+        ]
+
+        # Remove detections that are persistently at a static location (furniture).
+        # Confirmed track positions are whitelisted so stationary people pass through.
+        detections = self.static_filter.filter(
+            detections, whitelist_xy=_confirmed_xy or None
+        )
 
         # Track
         tracks = self.tracker.step(detections)
+        tracks = self._apply_reid(tracks, t0)
 
         # Classify behaviors
         behaviors = self.behavior_clf.update(tracks, t0)
@@ -1011,6 +1400,10 @@ if __name__ == "__main__":
         filter_cfg     = node_cfg.get("cluster_filter", {})
         tracking_cfg   = node_cfg.get("tracking",       {})
         behavior_cfg   = node_cfg.get("behavior",       {})
+        # Exclusion zones live under clustering in the config; merge into roi_cfg
+        # so apply_roi filters them before detection.
+        if "exclusion_zones" in cfg_clustering:
+            roi_cfg = {**roi_cfg, "exclusion_zones": cfg_clustering["exclusion_zones"]}
 
     if jetson_ip is None:
         jetson_ip = "172.26.42.167"
@@ -1031,11 +1424,12 @@ if __name__ == "__main__":
     if args.no_csv:
         tracking_cfg["csv_logging"] = False
 
-    cluster_tol  = float(cfg_clustering.get("cluster_tol",   0.4))
-    min_points   = int(cfg_clustering.get("min_points",    8))
-    max_points   = int(cfg_clustering.get("max_points",    800))
-    max_persons  = int(cfg_clustering.get("max_persons",   10))
-    accum_frames = int(cfg_clustering.get("accum_frames",  1))
+    cluster_tol        = float(cfg_clustering.get("cluster_tol",   0.4))
+    min_points         = int(cfg_clustering.get("min_points",    8))
+    max_points         = int(cfg_clustering.get("max_points",    800))
+    max_persons        = int(cfg_clustering.get("max_persons",   10))
+    accum_frames       = int(cfg_clustering.get("accum_frames",  1))
+    adaptive_accum_cfg = cfg_clustering.get("adaptive_accum", None)
 
     # CSV goes in project_root/data/tracklets/
     project_root = Path(__file__).resolve().parent.parent.parent
@@ -1061,5 +1455,6 @@ if __name__ == "__main__":
         tracking_cfg=tracking_cfg,
         behavior_cfg=behavior_cfg,
         csv_dir=csv_dir,
+        adaptive_accum_cfg=adaptive_accum_cfg,
     )
     node.spin()

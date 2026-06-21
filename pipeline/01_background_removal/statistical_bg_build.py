@@ -31,7 +31,10 @@ import time
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
-
+try:
+    from livox_ros_driver2.msg import CustomMsg
+except ImportError:
+    CustomMsg = None
 
 # ─── 核心建模逻辑 ─────────────────────────────────────────────────────────────
 

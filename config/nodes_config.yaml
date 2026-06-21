@@ -3,6 +3,7 @@ nodes:
     jetson_ip: 172.26.42.167
     jetson_user: kelrod
     rosbridge_port: 9090
+    lidar_launch_file: msg_MID360_launch.py
     lidar_topic: /livox/lidar
     foreground_topic: /livox/lidar_foreground
     bg_model_path: ~/background_statistical_node1.npz
@@ -16,7 +17,7 @@ nodes:
       max_persons: 10
       bbox_alpha: 0.4
       bbox_color: [1.0, 0.5, 0.0]
-      accum_frames: 4
+      accum_frames: 2          # fallback when adaptive_accum.enabled is false
       exclusion_zones:
         - cx: 1.56
           cy: -1.67
@@ -24,22 +25,30 @@ nodes:
         - cx: 2.54
           cy: -1.91
           radius: 0.80
+      adaptive_accum:
+        enabled: true
+        min_frames: 1          # frame count for fast/walking targets
+        max_frames: 6          # frame count for stationary targets
+        low_speed_thr: 0.2     # m/s — at or below: use max_frames
+        high_speed_thr: 0.3    # m/s — at or above: use min_frames
+        cold_start_frames: 1   # frames when no track velocity available (=min_frames avoids densifying cold regions)
+        assoc_radius: 1.5      # m — region radius around each track
     cluster_filter:
       min_xy_size: 0.10
       max_xy_size: 1.0
       max_aspect_ratio: 4.0
-      min_vertical_extent: 0.6   # metres; below this is furniture/floor noise — reject
+      min_vertical_extent: 0.30  # metres; below this is furniture/floor noise — reject
       max_vertical_extent: 2.2   # metres; above this is spurious (merged clusters) — reject
     roi:
       enabled: true
-      x_min: 0.3
+      x_min: -0.8
       x_max: 8.0
-      y_min: -5.0
-      y_max: -0.7
+      y_min: -4.5
+      y_max: 0.3
       z_min: -2.5
       z_max: -0.5
     tracking:
-      max_age: 8
+      max_age: 30              # reduced from 50: Re-ID covers longer absences (reid_max_age_sec=15s)
       min_hits: 3
       max_association_dist: 0.8
       csv_logging: true
@@ -52,6 +61,10 @@ nodes:
       direction_weight: 0.5
       direction_min_speed: 0.3
       coast_velocity_decay: 0.6
+      reid_thr: 0.5          # geometric Re-ID descriptor threshold (0 = disabled)
+      reid_max_age_sec: 15.0 # seconds a lost track stays revivable in the bank
+      merge_dist: 0.40       # m — merge confirmed tracks within this XY distance …
+      merge_min_frames: 5    # … for this many consecutive frames (ghost suppression)
     behavior:
       enabled: true
       window_frames: 30
@@ -60,3 +73,280 @@ nodes:
       talk_distance_threshold: 1.5
       talk_duration_sec: 30.0
       behavior_hold_frames: 5
+    rebuild_background:
+      duration: 120          # recording duration in seconds (min 30)
+      voxel_size: 0.10      # voxel size for background model in metres
+      max_frames: 600       # max frames used to build the model
+      bag_name: empty_scene_rebuild  # temp rosbag directory name on Jetson
+
+  node3:
+    jetson_ip: 172.26.165.5
+    jetson_user: kelrod
+    rosbridge_port: 9090
+    lidar_launch_file: msg_MID360_launch.py
+    lidar_topic: /livox/lidar
+    foreground_topic: /livox/lidar_foreground
+    bg_model_path: ~/background_statistical_node3.npz
+    bg_sigma: 2.5
+    bg_z_min: -2.8
+    bg_z_max: -0.5
+    clustering:
+      cluster_tol: 0.6
+      min_points: 20
+      max_points: 5000
+      max_persons: 10
+      bbox_alpha: 0.4
+      bbox_color: [1.0, 0.5, 0.0]
+      accum_frames: 2          # fallback when adaptive_accum.enabled is false
+      exclusion_zones:
+        - cx: 1.56
+          cy: -1.67
+          radius: 0.75
+        - cx: 2.54
+          cy: -1.91
+          radius: 0.80
+      adaptive_accum:
+        enabled: true
+        min_frames: 1
+        max_frames: 6
+        low_speed_thr: 0.2
+        high_speed_thr: 0.3
+        cold_start_frames: 1
+        assoc_radius: 1.5
+    cluster_filter:
+      min_xy_size: 0.10
+      max_xy_size: 1.0
+      max_aspect_ratio: 4.0
+      min_vertical_extent: 0.30  # metres; below this is furniture/floor noise — reject
+      max_vertical_extent: 2.2   # metres; above this is spurious (merged clusters) — reject
+    roi:
+      enabled: true
+      x_min: 0.3
+      x_max: 8.0
+      y_min: -5.0
+      y_max: -0.7
+      z_min: -2.5
+      z_max: -0.5
+    tracking:
+      max_age: 30
+      min_hits: 3
+      max_association_dist: 0.8
+      csv_logging: true
+      static_suppress_frames: 20
+      static_suppress_dist: 0.30
+      static_zone_history: 30
+      static_zone_radius: 0.5
+      static_zone_density: 0.75
+      static_zone_min_history: 15
+      direction_weight: 0.5
+      direction_min_speed: 0.3
+      coast_velocity_decay: 0.6
+      reid_thr: 0.5          # geometric Re-ID descriptor threshold (0 = disabled)
+      reid_max_age_sec: 15.0 # seconds a lost track stays revivable in the bank
+      merge_dist: 0.40
+      merge_min_frames: 5
+    behavior:
+      enabled: true
+      window_frames: 30
+      min_window_frames: 15
+      walk_speed_threshold: 0.5
+      talk_distance_threshold: 1.5
+      talk_duration_sec: 30.0
+      behavior_hold_frames: 5
+    rebuild_background:
+      duration: 120          # recording duration in seconds (min 30)
+      voxel_size: 0.10      # voxel size for background model in metres
+      max_frames: 600       # max frames used to build the model
+      bag_name: empty_scene_rebuild  # temp rosbag directory name on Jetson
+
+  node2:
+    jetson_ip: 172.26.42.1
+    jetson_user: kelrod
+    rosbridge_port: 9090
+    lidar_topic: /livox/lidar
+    foreground_topic: /livox/lidar_foreground
+    bg_model_path: ~/background_statistical_node1.npz
+    bg_sigma: 2.5
+    bg_z_min: -2.8
+    bg_z_max: -0.5
+    clustering:
+      cluster_tol: 0.6
+      min_points: 20
+      max_points: 5000
+      max_persons: 10
+      bbox_alpha: 0.4
+      bbox_color: [1.0, 0.5, 0.0]
+      accum_frames: 2          # fallback when adaptive_accum.enabled is false
+      exclusion_zones:
+        - cx: 1.56
+          cy: -1.67
+          radius: 0.75
+        - cx: 2.54
+          cy: -1.91
+          radius: 0.80
+      adaptive_accum:
+        enabled: true
+        min_frames: 1
+        max_frames: 6
+        low_speed_thr: 0.2
+        high_speed_thr: 0.3
+        cold_start_frames: 1
+        assoc_radius: 1.5
+    cluster_filter:
+      min_xy_size: 0.10
+      max_xy_size: 1.0
+      max_aspect_ratio: 4.0
+      min_vertical_extent: 0.30  # metres; below this is furniture/floor noise — reject
+      max_vertical_extent: 2.2   # metres; above this is spurious (merged clusters) — reject
+    roi:
+      enabled: true
+      x_min: 0.3
+      x_max: 8.0
+      y_min: -5.0
+      y_max: -0.7
+      z_min: -2.5
+      z_max: -0.5
+    tracking:
+      max_age: 30
+      min_hits: 3
+      max_association_dist: 0.8
+      csv_logging: true
+      static_suppress_frames: 20
+      static_suppress_dist: 0.30
+      static_zone_history: 30
+      static_zone_radius: 0.5
+      static_zone_density: 0.75
+      static_zone_min_history: 15
+      direction_weight: 0.5
+      direction_min_speed: 0.3
+      coast_velocity_decay: 0.6
+      reid_thr: 0.5          # geometric Re-ID descriptor threshold (0 = disabled)
+      reid_max_age_sec: 15.0 # seconds a lost track stays revivable in the bank
+      merge_dist: 0.40
+      merge_min_frames: 5
+    behavior:
+      enabled: true
+      window_frames: 30
+      min_window_frames: 15
+      walk_speed_threshold: 0.5
+      talk_distance_threshold: 1.5
+      talk_duration_sec: 30.0
+      behavior_hold_frames: 5
+    rebuild_background:
+      duration: 60          # recording duration in seconds (min 30)
+      voxel_size: 0.15      # voxel size for background model in metres
+      max_frames: 300       # max frames used to build the model
+      bag_name: empty_scene_rebuild  # temp rosbag directory name on Jetson
+
+  # ─── Virtual fused node ──────────────────────────────────────────────────────
+  # Not a physical Jetson. Wires clustering_node.py / tracking_node.py into the
+  # dual-LiDAR fused pipeline:
+  #   overlay_node.py subscribes to both LiDARs, applies the node3→node1 rigid
+  #   transform, and republishes the merged cloud to /fused/foreground via
+  #   node1's rosbridge (ws://172.26.42.167:9090).
+  #
+  # Usage:
+  #   python3 pipeline/03_tracking/tracking_node.py \
+  #       --config config/nodes_config.yaml --node fused
+  #   python3 pipeline/02_detection/clustering_node.py \
+  #       --config config/nodes_config.yaml --node fused
+  #
+  # The fused cloud is already in node1's coordinate frame, so all ROI, exclusion
+  # zones, and clustering params are identical to node1.
+  # NOTE: x_max=8.0 clips ~3.2 m of node3's far coverage (node3 extends to x≈11.2 m
+  # in node1's frame); y_min=-5.0 clips ~3.1 m (node3 extends to y≈-8.1 m).
+  # Node3's coverage area may also contain different static objects not covered by
+  # the existing exclusion_zones — review once the physical layout is confirmed.
+  fused:
+    virtual: true
+    jetson_ip: 172.26.42.167      # overlay_node publishes via node1's rosbridge
+    rosbridge_port: 9090
+    foreground_topic: /fused/foreground
+    clustering:
+      cluster_tol: 0.6
+      min_points: 20
+      max_points: 5000
+      max_persons: 10
+      bbox_alpha: 0.4
+      bbox_color: [1.0, 0.5, 0.0]
+      accum_frames: 2
+      exclusion_zones:
+        - cx: 1.56
+          cy: -1.67
+          radius: 0.75
+        - cx: 2.54
+          cy: -1.91
+          radius: 0.80
+      adaptive_accum:
+        enabled: true
+        min_frames: 1
+        max_frames: 6
+        low_speed_thr: 0.2
+        high_speed_thr: 0.3
+        cold_start_frames: 1
+        assoc_radius: 1.5
+    cluster_filter:
+      min_xy_size: 0.10
+      max_xy_size: 1.0
+      max_aspect_ratio: 4.0
+      min_vertical_extent: 0.30
+      max_vertical_extent: 2.2
+    roi:
+      enabled: true
+      x_min: -0.8
+      x_max: 8.0
+      y_min: -4.5
+      y_max: 0.3
+      z_min: -2.5
+      z_max: -0.5
+    tracking:
+      max_age: 30
+      min_hits: 3
+      max_association_dist: 0.8
+      csv_logging: true
+      static_suppress_frames: 20
+      static_suppress_dist: 0.30
+      static_zone_history: 30
+      static_zone_radius: 0.5
+      static_zone_density: 0.75
+      static_zone_min_history: 15
+      direction_weight: 0.5
+      direction_min_speed: 0.3
+      coast_velocity_decay: 0.6
+      reid_thr: 0.5
+      reid_max_age_sec: 15.0
+      merge_dist: 0.40
+      merge_min_frames: 5
+    behavior:
+      enabled: true
+      window_frames: 30
+      min_window_frames: 15
+      walk_speed_threshold: 0.5
+      talk_distance_threshold: 1.5
+      talk_duration_sec: 30.0
+      behavior_hold_frames: 5
+
+
+# ─── Dual-LiDAR Fusion / Overlay ─────────────────────────────────────────────
+# Used exclusively by pipeline/06_fusion/overlay_node.py.
+# node1 is the reference frame — all other sources are expressed relative to it.
+fusion:
+  sources:
+    - node: node1
+      color: [1.0, 0.5, 0.0]        # orange — node1 IS the reference frame; no transform needed
+
+    - node: node3
+      color: [0.0, 0.5, 1.0]        # blue
+      # ICP calibration — calib_out/node3_to_node1.txt
+      # yaw ≈ -179° (SE vs NW 180° mounting), corridor overlap 0.76, RMSE 0.15 m
+      # Row-major 4×4 homogeneous matrix (node3 → node1 reference frame):
+      #   top-left 3×3 = rotation R,  right column = translation in metres
+      transform_to_common:
+        - [-0.999514,  0.012310,  0.028644,  7.228458]
+        - [-0.012119, -0.999903,  0.006848, -4.071617]
+        - [ 0.028726,  0.006498,  0.999566, -0.281624]
+        - [ 0.000000,  0.000000,  0.000000,  1.000000]
+
+  output_topic: /fused/foreground
+  output_frame:  fused
+  publish_via:   node1   # which Jetson's rosbridge Foxglove should connect to
