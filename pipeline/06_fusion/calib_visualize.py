@@ -11,7 +11,7 @@ This is fully OFFLINE — no rosbridge, no Foxglove, no network. Just the two .n
 files on disk.
 
 Run from repo root:
-    python3 calib_visualize.py \
+    python3 pipeline/06_fusion/calib_visualize.py \
         --node1 models/background_statistical_node1.npz \
         --node3 models/background_statistical_node3.npz
 

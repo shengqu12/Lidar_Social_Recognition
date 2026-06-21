@@ -5,8 +5,8 @@ candidate ROI rectangle that can be ROTATED, so you can see how much the room
 is tilted and whether a rotated ROI is actually needed.
 
 Run from repo root:
-    python3 calib_roi_preview.py --xmin 0 --xmax 11 --ymin -5 --ymax 0 --angle 0
-    python3 calib_roi_preview.py --cx 5 --cy -2.5 --w 11 --h 5 --angle 8
+    python3 pipeline/06_fusion/calib_roi_preview.py --xmin 0 --xmax 11 --ymin -5 --ymax 0 --angle 0
+    python3 pipeline/06_fusion/calib_roi_preview.py --cx 5 --cy -2.5 --w 11 --h 5 --angle 8
 
 Two ways to specify the box:
   (A) axis-aligned bounds: --xmin --xmax --ymin --ymax  (use --angle to rotate

@@ -14,7 +14,7 @@ metric (symmetry cannot fake that). It prints the top candidates so we pick the
 physically-correct one, not just the highest fitness.
 
 Run:
-    python3 calib_icp.py --tx 7.32 --ty 3.71
+    python3 pipeline/06_fusion/calib_icp.py --tx 7.32 --ty 3.71
 """
 import argparse, os
 import numpy as np
