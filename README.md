@@ -14,8 +14,8 @@ workstation.
 
 ## Current Deployment Stage
 
-! [node1](./images/lidar_node1.jpeg)
-! [node2](./images/lidar_node3.jpeg)
+![node1](./images/lidar_node1.jpeg)
+![node2](./images/lidar_node3.jpeg)
 ## Quickstart
 
 Bring up the full fused pipeline (both LiDARs, background removal, fusion
