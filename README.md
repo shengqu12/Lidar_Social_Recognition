@@ -12,6 +12,10 @@ overlapping fields of view, ICP-calibrated into a common frame). It is offline
 by design: recording happens on the Jetsons, inference runs on the development
 workstation.
 
+## Current Deployment Stage
+
+! [node1](../lidar_node1.jpeg)
+! [node2](../lidar_node3.jpeg)
 ## Quickstart
 
 Bring up the full fused pipeline (both LiDARs, background removal, fusion
