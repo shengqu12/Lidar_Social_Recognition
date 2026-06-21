@@ -22,3 +22,10 @@ card_reader/
 
 # OS
 .DS_Store
+
+# Data artifacts and diagnostic outputs
+data/tracklets/*.csv
+eval/diag_figs/
+calib_out/*.png
+*.db3
+inspect_bg_npz.py
